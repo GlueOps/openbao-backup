@@ -1,0 +1,3 @@
+baokv.env
+*.json
+__pycache__/

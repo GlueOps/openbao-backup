@@ -1,0 +1,4 @@
+# only the script goes into the image; keep secrets/dumps out of the context
+*
+!Dockerfile
+!baokv.py
