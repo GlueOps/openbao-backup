@@ -87,7 +87,8 @@ Restore always audits the current server state first and prints the full plan
 - If the file references a KV v2 mount that doesn't exist on the server,
   restore aborts before making changes (mount creation is blocked by the
   proxy — create the mount manually first).
-- The dump file contains all secret values in plaintext. Keep it out of git
-  (see `.gitignore`) and treat it like a credential. Note that env vars are
+- The dump file contains all secret values in plaintext. Treat it like a
+  credential. Dump/restore filenames are required to end in `.json` so they
+  always stay covered by the `*.json` rule in `.gitignore`. Note that env vars are
   visible in `docker inspect` on a running container and in your shell
   history if set inline — prefer `--env-file` with a mode-600 `baokv.env`.

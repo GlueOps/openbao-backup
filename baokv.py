@@ -225,14 +225,23 @@ def cmd_restore(args):
     print(f"\n# done: {len(to_write)} imported, {len(to_delete)} deleted")
 
 
+def json_path(value):
+    # dump files hold plaintext secrets; forcing a .json suffix keeps them
+    # covered by the repo's *.json gitignore rule
+    if not value.endswith(".json"):
+        raise argparse.ArgumentTypeError(
+            f"'{value}' must end in .json so dump files stay git-ignored")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="audit all secrets (paths + key names, no values)")
     p = sub.add_parser("dump", help="export all kv-v2 secrets to a JSON file")
-    p.add_argument("-o", "--output", required=True)
+    p.add_argument("-o", "--output", required=True, type=json_path)
     p = sub.add_parser("restore", help="DESTRUCTIVE: make server match a dump file")
-    p.add_argument("-i", "--input", required=True)
+    p.add_argument("-i", "--input", required=True, type=json_path)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--yes", action="store_true", help="skip confirmation prompt")
     args = ap.parse_args()
