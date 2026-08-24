@@ -6,6 +6,7 @@ set -e
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 NET="baokv-test-$$"
 SRV="baokv-test-server-$$"
+SERVER_IMAGE=${SERVER_IMAGE:-openbao/openbao:2.4.4}
 
 cleanup() {
     docker rm -f "$SRV" >/dev/null 2>&1 || true
@@ -16,14 +17,14 @@ trap cleanup EXIT INT TERM
 echo "# building baokv image ..."
 docker build -q -t baokv "$DIR" >/dev/null
 
-echo "# starting disposable OpenBao dev server ..."
+echo "# starting disposable OpenBao dev server ($SERVER_IMAGE) ..."
 docker network create "$NET" >/dev/null
 docker run -d --name "$SRV" --network "$NET" --network-alias openbao \
     -e VAULT_DEV_ROOT_TOKEN_ID=test-root-token \
     -e BAO_DEV_ROOT_TOKEN_ID=test-root-token \
     -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
     -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
-    openbao/openbao:2.4.4 >/dev/null
+    "$SERVER_IMAGE" >/dev/null
 
 i=0
 until docker run --rm --network "$NET" --entrypoint bao \

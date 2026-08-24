@@ -1,3 +1,5 @@
 baokv.env
 *.json
+!test/fixtures/*.json
 __pycache__/
+test/.xver-work/

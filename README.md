@@ -99,6 +99,25 @@ confirmation prompt, history wipe, idempotence, missing-mount abort),
 limited-token partial dumps, dump file properties, and full
 wipe-and-restore round trips. Your real server is never touched.
 
+Run the same suite against a different server version with
+`SERVER_IMAGE=openbao/openbao:2.6.1 test/run-tests.sh`.
+
+## Cross-version baseline
+
+```bash
+test/cross-version.sh                    # default matrix: 2.4.4 2.5.5 2.6.1
+VERSIONS="2.4.4 2.6.1" test/cross-version.sh
+```
+
+Guards against server upgrades changing dump/restore behavior. A checked-in
+golden fixture (`test/fixtures/golden.json`, fake data covering nesting,
+unicode paths, custom metadata, and type edge cases) is restored into a
+fresh dev server of each version and dumped back; every dump must be
+content-identical to the golden (paths, data, custom_metadata — timestamps
+legitimately differ). Each version restores the dump produced by the
+previous version, which simulates restoring a pre-upgrade backup after a
+server upgrade. Run this before bumping the pinned OpenBao version.
+
 ## Notes / limitations
 
 - Only KV v2 mounts are handled (all of them are auto-discovered via
