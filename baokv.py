@@ -51,17 +51,22 @@ def setup_env():
     os.environ["VAULT_TOKEN"] = require_env("BAO_TOKEN", "your OpenBao token")
 
 
+last_error = None
+
+
 def bao(subcommand, *rest, stdin=None, check=True):
     """Run a bao subcommand; inject the oauth2 cookie.
 
     `subcommand` is the full space-separated command ("kv metadata delete");
     the -header flag must come after it but before positional args.
     """
+    global last_error
     cmd = (["bao"] + subcommand.split()
            + [f"-header={cookie_header()}"] + list(rest))
     p = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
+    last_error = None if p.returncode == 0 else (p.stderr or p.stdout).strip()
     if p.returncode != 0:
-        err = (p.stderr or p.stdout).strip()
+        err = last_error
         if "Redirecting" in err or "302" in err:
             sys.exit("error: got an OAuth redirect — your _oauth2_proxy "
                      "cookie has likely expired. Grab a fresh one from your "
@@ -100,6 +105,12 @@ def walk(mount):
     while stack:
         prefix = stack.pop()
         out = bao_json("kv list", "-format=json", f"{mount}/{prefix}", check=False)
+        if out is None and last_error and "permission denied" in last_error:
+            # a silently-missing subtree would be DELETED by a later restore
+            print(f"#   WARNING: cannot list {mount}/{prefix} (permission "
+                  "denied) — this whole subtree is MISSING from the result; "
+                  "do not restore from a dump made with this token",
+                  file=sys.stderr)
         for entry in (out or []):
             if entry.endswith("/"):
                 stack.append(prefix + entry)
@@ -123,6 +134,21 @@ def read_secret(mount, path):
     }
 
 
+def has_unsafe_number(v):
+    """True if any number in v needs more precision than float64 offers —
+    the bao CLI decodes JSON numbers as float64, so such values may already
+    have been rounded and cannot be trusted bit-for-bit."""
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return abs(v) >= 2 ** 53
+    if isinstance(v, dict):
+        return any(has_unsafe_number(x) for x in v.values())
+    if isinstance(v, list):
+        return any(has_unsafe_number(x) for x in v)
+    return False
+
+
 def collect(include_values):
     result = {}
     for mount in kvv2_mounts():
@@ -135,6 +161,11 @@ def collect(include_values):
                     print(f"#   WARNING: skipping {mount}/{path} "
                           "(current version deleted or unreadable)", file=sys.stderr)
                     continue
+                if has_unsafe_number(s["data"]):
+                    print(f"#   WARNING: {mount}/{path} contains a number at "
+                          "or above 2^53 — the bao CLI rounds such values to "
+                          "float64, so it may not round-trip exactly; store "
+                          "huge numbers as strings", file=sys.stderr)
                 secrets[path] = s
             else:
                 secrets[path] = None

@@ -83,7 +83,7 @@ test/run-tests.sh
 
 Hermetic e2e regression suite — needs only the docker CLI. It builds the
 image, starts a disposable OpenBao dev server in a private docker network,
-runs 84 checks against it, and tears everything down. Coverage: CLI/config
+runs 89 checks against it, and tears everything down. Coverage: CLI/config
 guards, kv-v2 mount discovery (v1 and system mounts excluded), nesting
 depths 1–10, special-character paths (spaces, unicode/emoji, quotes, shell
 metacharacters, `% # ?`, leading dashes, backslashes, dot-segments,
@@ -108,12 +108,15 @@ wipe-and-restore round trips. Your real server is never touched.
   secret's history to version 1.
 - Secrets whose current version is (soft-)deleted are skipped with a warning
   during dump — and will therefore be **removed** by a later restore.
-- The same applies to secrets your token cannot read: dump skips them with a
-  warning, so restoring that partial dump would **delete** them. Always dump
-  with a token that can read everything you intend to keep.
-- Integers larger than float64 can represent exactly (e.g. int64 max) may be
-  rounded by the bao CLI at the time a secret is **first written**; dump and
-  restore then faithfully preserve whatever the server actually stored.
+- The same applies to secrets your token cannot read or list: dump warns
+  about unreadable secrets and un-listable subtrees, and both would be
+  **deleted** if you restored from that partial dump. Always dump with a
+  token that can read and list everything you intend to keep.
+- Numbers at or above 2^53 (e.g. int64 max) are rounded to float64 precision
+  by OpenBao itself — even when written through the raw HTTP API, the exact
+  value is never observable again, so dump/restore cannot make it worse.
+  Dump prints a warning when it sees such numbers; store huge numbers as
+  strings if you need them exact.
 - If the file references a KV v2 mount that doesn't exist on the server,
   restore aborts before making changes (mount creation is blocked by the
   proxy — create the mount manually first).

@@ -539,6 +539,63 @@ p = tool("dump", "-o", "fulltoken.json")
 check("P3 full token still sees everything",
       "hidden/topsecret" in load_mounts("fulltoken.json")["secret"])
 
+# ---------------------------- Q. precision limits and silent-subtree guards
+print("== Q. numeric precision and silent-subtree guards ==")
+import urllib.request
+
+reset_mount("secret")
+reset_mount("kv2b")
+
+
+def api(method, path, body=None):
+    req = urllib.request.Request(
+        os.environ["BAO_ADDR"] + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+        headers={"X-Vault-Token": os.environ["BAO_TOKEN"],
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read() or b"null")
+
+
+INT64_MAX = 9223372036854775807
+FLOAT64_SAFE = 9007199254740991  # 2^53 - 1
+api("POST", "/v1/secret/data/api-written",
+    {"data": {"exact": INT64_MAX, "safe": FLOAT64_SAFE, "s": "stringval"}})
+server_view = api("GET", "/v1/secret/data/api-written")["data"]["data"]
+print(f"   info: server stores int64 max exactly: {server_view['exact'] == INT64_MAX}")
+cli_view = get_data("secret", "api-written")
+print(f"   info: bao CLI reads it back as: {cli_view['exact']}")
+p = tool("dump", "-o", "precision.json")
+dumped = load_mounts("precision.json")["secret"]["api-written"]["data"]
+check("Q1 dump warns about numbers at/above 2^53",
+      "2^53" in p.stdout + p.stderr, p.stderr)
+check("Q2 numbers within float64-safe range are exact", dumped["safe"] == FLOAT64_SAFE)
+check("Q3 strings alongside huge numbers unaffected", dumped["s"] == "stringval")
+if dumped["exact"] != INT64_MAX:
+    print(f"   documented limitation: API-written int64 max is altered by the "
+          f"CLI on read: {INT64_MAX} -> {dumped['exact']!r} (warned about in Q1)")
+
+# list-denied subtree must warn loudly (it would be deleted by a restore)
+put("secret", "visible2", {"k": "v"})
+put("secret", "unlistable/inner", {"k": "v"})
+POLICY2 = '''
+path "secret/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "secret/metadata/unlistable" { capabilities = ["deny"] }
+path "secret/metadata/unlistable/*" { capabilities = ["deny"] }
+path "secret/data/unlistable/*" { capabilities = ["deny"] }
+'''
+p = bao("policy", "write", "nolist", "-", stdin=POLICY2)
+assert p.returncode == 0, p.stderr
+p = bao("token", "create", "-policy=nolist", "-policy=default", "-format=json")
+nolist_token = json.loads(p.stdout)["auth"]["client_token"]
+p = tool("dump", "-o", "nolist.json", env={**FULL_ENV, "BAO_TOKEN": nolist_token})
+m = load_mounts("nolist.json")["secret"]
+check("Q4 list-denied subtree missing from dump but loudly warned",
+      p.returncode == 0 and "unlistable/inner" not in m
+      and "MISSING" in p.stdout + p.stderr, p.stderr)
+check("Q5 listable secrets still dumped", m.get("visible2", {}).get("data") == {"k": "v"})
+
 # -------------------------------------------------------------------- report
 print()
 failed = [n for n, ok in results if not ok]
