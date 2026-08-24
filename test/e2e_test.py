@@ -200,6 +200,50 @@ p = bao("kv", "metadata", "get", "-format=json", "secret/meta/app")
 cm = json.loads(p.stdout)["data"]["custom_metadata"]
 check("E3 custom_metadata restored", cm == {"owner": "alice", "env": "prod"}, cm)
 
+
+def get_meta(path):
+    p_ = bao("kv", "metadata", "get", "-format=json", f"secret/{path}")
+    return json.loads(p_.stdout)["data"]
+
+
+UNI_CM = {"键": "日本語 🚀", "note": 'spaces & "quotes" | pipes'}
+put("secret", "meta/uni", {"k": "v"})
+p = bao("kv", "metadata", "put", "-custom-metadata=键=日本語 🚀",
+        '-custom-metadata=note=spaces & "quotes" | pipes', "secret/meta/uni")
+assert p.returncode == 0, p.stderr
+tool("dump", "-o", "meta2.json")
+m2 = load_mounts("meta2.json")["secret"]
+check("E4 unicode/special-char custom_metadata captured",
+      m2["meta/uni"]["custom_metadata"] == UNI_CM, m2["meta/uni"]["custom_metadata"])
+reset_mount("secret")
+tool("restore", "-i", "meta2.json", "--yes")
+check("E5 unicode/special-char custom_metadata restored",
+      get_meta("meta/uni")["custom_metadata"] == UNI_CM)
+# drift: changed values and extra keys reverted; metadata absent in the file
+# must end up absent on the server
+bao("kv", "metadata", "put", "-custom-metadata=owner=mallory",
+    "-custom-metadata=extra=drift", "secret/meta/app")
+bao("kv", "metadata", "put", "-custom-metadata=sneaky=added", "secret/meta/plain")
+tool("restore", "-i", "meta2.json", "--yes")
+check("E6 custom_metadata drift reverted on restore",
+      get_meta("meta/app")["custom_metadata"] == {"owner": "alice", "env": "prod"},
+      get_meta("meta/app")["custom_metadata"])
+check("E7 custom_metadata absent in file is removed from server",
+      not get_meta("meta/plain")["custom_metadata"])
+entry = m2["meta/app"]
+check("E8 informational fields recorded per secret",
+      entry["version_at_export"] == 1 and entry["created_time_at_export"])
+# documented limitation, pinned: per-secret settings are NOT preserved
+bao("kv", "metadata", "put", "-max-versions=3", "-delete-version-after=24h",
+    "secret/meta/app")
+tool("dump", "-o", "meta3.json")
+reset_mount("secret")
+tool("restore", "-i", "meta3.json", "--yes")
+md = get_meta("meta/app")
+check("E9 per-secret settings documented as dropped on restore",
+      md.get("max_versions", 0) == 0
+      and md.get("delete_version_after", "0s") in ("0s", "0", ""), md)
+
 # ------------------------------------- F. soft-deleted / destroyed versions
 print("== F. soft-deleted and destroyed versions ==")
 reset_mount("secret")

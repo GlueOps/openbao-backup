@@ -83,7 +83,7 @@ test/run-tests.sh
 
 Hermetic e2e regression suite — needs only the docker CLI. It builds the
 image, starts a disposable OpenBao dev server in a private docker network,
-runs 89 checks against it, and tears everything down. Coverage: CLI/config
+runs 95 checks against it, and tears everything down. Coverage: CLI/config
 guards, kv-v2 mount discovery (v1 and system mounts excluded), nesting
 depths 1–10, special-character paths (spaces, unicode/emoji, quotes, shell
 metacharacters, `% # ?`, leading dashes, backslashes, dot-segments,
