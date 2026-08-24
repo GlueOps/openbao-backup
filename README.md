@@ -75,6 +75,24 @@ with `--env-file baokv.env`.
 Restore always audits the current server state first and prints the full plan
 (creates / overwrites / deletes) before touching anything.
 
+## Tests
+
+```bash
+test/run-tests.sh
+```
+
+Hermetic e2e regression suite — needs only the docker CLI. It builds the
+image, starts a disposable OpenBao dev server in a private docker network,
+runs 62 checks against it, and tears everything down. Coverage: CLI/config
+guards, kv-v2 mount discovery (v1 and system mounts excluded), nesting
+depths 1–10, special-character paths (spaces, unicode/emoji, quotes, shell
+metacharacters, `% # ?`, leading dashes, leaf-and-folder same-name), value
+edge cases (multiline, 100KB, empty keys/values, nested JSON, non-string
+types), custom metadata round-trip, soft-deleted/destroyed version skipping,
+restore semantics (create/overwrite/delete, dry-run, confirmation prompt,
+history wipe, idempotence, missing-mount abort), dump file properties, and
+full wipe-and-restore round trips. Your real server is never touched.
+
 ## Notes / limitations
 
 - Only KV v2 mounts are handled (all of them are auto-discovered via
