@@ -221,9 +221,11 @@ def cmd_restore(args):
         bao("kv metadata delete", f"{mount}/{path}")
         print(f"deleted {mount}/{path}")
     for mount, path, s in to_write:
-        # metadata delete wipes old versions so the imported state is clean
+        # metadata delete wipes old versions so the imported state is clean;
+        # -cas=0 is then always valid and keeps restore working on mounts
+        # with cas_required=true
         bao("kv metadata delete", f"{mount}/{path}", check=False)
-        bao("kv put", f"{mount}/{path}", "-",
+        bao("kv put", "-cas=0", f"{mount}/{path}", "-",
             stdin=json.dumps(s["data"]))
         if s.get("custom_metadata"):
             bao("write", f"{mount}/metadata/{path}", "-",

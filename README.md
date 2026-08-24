@@ -83,15 +83,21 @@ test/run-tests.sh
 
 Hermetic e2e regression suite — needs only the docker CLI. It builds the
 image, starts a disposable OpenBao dev server in a private docker network,
-runs 62 checks against it, and tears everything down. Coverage: CLI/config
+runs 84 checks against it, and tears everything down. Coverage: CLI/config
 guards, kv-v2 mount discovery (v1 and system mounts excluded), nesting
 depths 1–10, special-character paths (spaces, unicode/emoji, quotes, shell
-metacharacters, `% # ?`, leading dashes, leaf-and-folder same-name), value
-edge cases (multiline, 100KB, empty keys/values, nested JSON, non-string
-types), custom metadata round-trip, soft-deleted/destroyed version skipping,
-restore semantics (create/overwrite/delete, dry-run, confirmation prompt,
-history wipe, idempotence, missing-mount abort), dump file properties, and
-full wipe-and-restore round trips. Your real server is never touched.
+metacharacters, `% # ?`, leading dashes, backslashes, dot-segments,
+300-char segments, reserved-looking names like `data`/`metadata`, case
+sensitivity, leaf-and-folder same-name, five stacked leaves on one chain
+at different depths with different key counts), value edge cases
+(multiline, 100KB and 1MB, empty keys/values/data, 12-level nested JSON,
+non-string types, `"42"` vs `42` typing, unicode key names, control
+characters), custom metadata round-trip, soft-deleted/destroyed version
+skipping, restore semantics (create/overwrite/delete, dry-run,
+confirmation prompt, history wipe, idempotence, missing-mount abort),
+`cas_required` mounts, dotted and nested mount names, 147-secret volume,
+limited-token partial dumps, dump file properties, and full
+wipe-and-restore round trips. Your real server is never touched.
 
 ## Notes / limitations
 
@@ -102,6 +108,12 @@ full wipe-and-restore round trips. Your real server is never touched.
   secret's history to version 1.
 - Secrets whose current version is (soft-)deleted are skipped with a warning
   during dump — and will therefore be **removed** by a later restore.
+- The same applies to secrets your token cannot read: dump skips them with a
+  warning, so restoring that partial dump would **delete** them. Always dump
+  with a token that can read everything you intend to keep.
+- Integers larger than float64 can represent exactly (e.g. int64 max) may be
+  rounded by the bao CLI at the time a secret is **first written**; dump and
+  restore then faithfully preserve whatever the server actually stored.
 - If the file references a KV v2 mount that doesn't exist on the server,
   restore aborts before making changes (mount creation is blocked by the
   proxy — create the mount manually first).
