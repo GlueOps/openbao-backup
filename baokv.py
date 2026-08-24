@@ -80,8 +80,9 @@ def bao_json(*args, **kw):
 def preflight():
     info = bao_json("token lookup", "-format=json")
     d = info["data"]
+    expires = (d.get("expire_time") or "never")[:10]
     print(f"# auth ok: {d.get('display_name')} policies={d.get('policies')} "
-          f"token expires {d.get('expire_time', '?')[:10]}", file=sys.stderr)
+          f"token expires {expires}", file=sys.stderr)
 
 
 def kvv2_mounts():
@@ -109,8 +110,10 @@ def walk(mount):
 
 def read_secret(mount, path):
     out = bao_json("kv get", "-format=json", f"{mount}/{path}", check=False)
-    if out is None:
-        return None  # current version deleted/destroyed, or unreadable
+    if out is None or out["data"]["data"] is None:
+        # unreadable, or current version soft-deleted/destroyed (the API
+        # then returns success with data: null)
+        return None
     meta = out["data"]["metadata"]
     return {
         "data": out["data"]["data"],
@@ -140,6 +143,7 @@ def collect(include_values):
 
 
 def cmd_list(_args):
+    preflight()
     data = collect(include_values=True)
     total = 0
     for mount, secrets in data.items():
@@ -153,6 +157,7 @@ def cmd_list(_args):
 
 
 def cmd_dump(args):
+    preflight()
     data = collect(include_values=True)
     doc = {
         "format": DUMP_FORMAT,
@@ -169,11 +174,13 @@ def cmd_dump(args):
 
 
 def cmd_restore(args):
+    # validate the input file fully before any server interaction
     with open(args.input) as f:
         doc = json.load(f)
     if doc.get("format") != DUMP_FORMAT:
         sys.exit(f"error: {args.input} is not a {DUMP_FORMAT} file")
 
+    preflight()
     file_mounts = doc["mounts"]
     server_mounts = kvv2_mounts()
     missing = [m for m in file_mounts if m not in server_mounts]
@@ -247,7 +254,6 @@ def main():
     args = ap.parse_args()
 
     setup_env()
-    preflight()
     {"list": cmd_list, "dump": cmd_dump, "restore": cmd_restore}[args.cmd](args)
 
 
