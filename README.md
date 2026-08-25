@@ -54,12 +54,12 @@ docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
 # Export everything to a file (file is created with mode 600)
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  "$IMAGE" dump -o secrets-export-$(date +%F).json
+  "$IMAGE" dump -o secrets-export-$(date +%F-%H%M%S).json
 
 # Preview a restore without changing anything
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  "$IMAGE" restore -i secrets-export-2026-08-24.json --dry-run
+  "$IMAGE" restore -i secrets-export-2026-08-24-213045.json --dry-run
 
 # DESTRUCTIVE restore: makes the server exactly match the file
 #  - every secret in the file is imported (old version history is wiped first)
@@ -68,12 +68,12 @@ docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
 # -it is required so you can type "yes" at the confirmation prompt
 docker run --rm -it -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  "$IMAGE" restore -i secrets-export-2026-08-24.json
+  "$IMAGE" restore -i secrets-export-2026-08-24-213045.json
 
 # Same, without the prompt (for scripts/cron)
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  "$IMAGE" restore -i secrets-export-2026-08-24.json --yes
+  "$IMAGE" restore -i secrets-export-2026-08-24-213045.json --yes
 ```
 
 Using an env file instead of exported variables: replace the three `-e` flags
