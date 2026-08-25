@@ -42,47 +42,39 @@ export BAO_COOKIE='PASTE_COOKIE_VALUE_HERE'
 Every command mounts the current directory at `/work` (where dump files are
 read/written) and runs as your uid so files on the host belong to you.
 
-Define this once per shell (or drop it in your `~/.bashrc`/`~/.zshrc`). It
-runs the released image with all the plumbing flags: credentials passed
-through, your uid so dump files belong to you, the current directory
-mounted at `/work`, and a TTY only when you're at a terminal (so the
-restore confirmation prompt works and piping still behaves):
-
 ```bash
 # Latest released image (this line is kept current by release-please)
-export IMAGE=ghcr.io/glueops/openbao-backup:v0.1.0 # x-release-please-version
+IMAGE=ghcr.io/glueops/openbao-backup:v0.1.0 # x-release-please-version
 
-baokv() {
-  docker run --rm -i $([ -t 0 ] && [ -t 1 ] && echo -t) \
-    -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
-    --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-    "$IMAGE" "$@"
-}
-```
-
-Then every command is short:
-
-```bash
 # Audit: every secret path, version, and key names — no values printed
-baokv list
+docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
+  "$IMAGE" list
 
 # Export everything to a file (file is created with mode 600)
-baokv dump -o secrets-export-$(date +%F).json
+docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
+  "$IMAGE" dump -o secrets-export-$(date +%F).json
 
 # Preview a restore without changing anything
-baokv restore -i secrets-export-2026-08-24.json --dry-run
+docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
+  "$IMAGE" restore -i secrets-export-2026-08-24.json --dry-run
 
 # DESTRUCTIVE restore: makes the server exactly match the file
 #  - every secret in the file is imported (old version history is wiped first)
 #  - every secret on the server that is NOT in the file is permanently deleted
 #    (kv metadata delete = all versions gone)
-baokv restore -i secrets-export-2026-08-24.json        # asks you to type "yes"
-baokv restore -i secrets-export-2026-08-24.json --yes  # no prompt (scripts/cron)
-```
+# -it is required so you can type "yes" at the confirmation prompt
+docker run --rm -it -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
+  "$IMAGE" restore -i secrets-export-2026-08-24.json
 
-(A plain `FLAGS="..."` env variable would word-split paths with spaces —
-the function is the shell-safe version of the same idea. For local
-development builds, `IMAGE=baokv baokv list` works too.)
+# Same, without the prompt (for scripts/cron)
+docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
+  "$IMAGE" restore -i secrets-export-2026-08-24.json --yes
+```
 
 Using an env file instead of exported variables: replace the three `-e` flags
 with `--env-file baokv.env`.
