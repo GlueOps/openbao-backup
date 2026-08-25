@@ -6,13 +6,17 @@ dependency is the docker CLI. The `bao` CLI inside the container makes all
 API calls; the oauth2-proxy cookie is injected on every request via
 `bao -header="Cookie=..."`.
 
-## Build
+## Get the image
+
+Every release publishes the image to GHCR. Pull the current release (the
+version below is rewritten automatically by release-please on every release):
 
 ```bash
-docker build -t baokv .
+docker pull ghcr.io/glueops/openbao-backup:v0.1.0 # x-release-please-version
 ```
 
-Rebuild after any change to `baokv.py` or the `Dockerfile`.
+For local development, build with `docker build -t baokv .` and use `baokv`
+in place of the image reference below (the test suites always build locally).
 
 ## Configuration (env vars)
 
@@ -39,20 +43,23 @@ Every command mounts the current directory at `/work` (where dump files are
 read/written) and runs as your uid so files on the host belong to you.
 
 ```bash
+# Latest released image (this line is kept current by release-please)
+IMAGE=ghcr.io/glueops/openbao-backup:v0.1.0 # x-release-please-version
+
 # Audit: every secret path, version, and key names — no values printed
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  baokv list
+  "$IMAGE" list
 
 # Export everything to a file (file is created with mode 600)
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  baokv dump -o secrets-export-$(date +%F).json
+  "$IMAGE" dump -o secrets-export-$(date +%F).json
 
 # Preview a restore without changing anything
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  baokv restore -i secrets-export-2026-08-24.json --dry-run
+  "$IMAGE" restore -i secrets-export-2026-08-24.json --dry-run
 
 # DESTRUCTIVE restore: makes the server exactly match the file
 #  - every secret in the file is imported (old version history is wiped first)
@@ -61,12 +68,12 @@ docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
 # -it is required so you can type "yes" at the confirmation prompt
 docker run --rm -it -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  baokv restore -i secrets-export-2026-08-24.json
+  "$IMAGE" restore -i secrets-export-2026-08-24.json
 
 # Same, without the prompt (for scripts/cron)
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
-  baokv restore -i secrets-export-2026-08-24.json --yes
+  "$IMAGE" restore -i secrets-export-2026-08-24.json --yes
 ```
 
 Using an env file instead of exported variables: replace the three `-e` flags
