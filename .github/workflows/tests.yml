@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  e2e:
+    name: e2e (server ${{ matrix.server }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        server: ["2.4.4", "2.6.1"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run e2e suite
+        env:
+          SERVER_IMAGE: openbao/openbao:${{ matrix.server }}
+        run: test/run-tests.sh
+
+  cross-version:
+    name: cross-version golden baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cross-version checks
+        run: test/cross-version.sh
