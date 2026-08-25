@@ -18,7 +18,9 @@
   "packages": {
     ".": {
       "release-type": "simple",
-      "package-name": "openbao-backup"
+      "package-name": "openbao-backup",
+      "initial-version": "0.1.0",
+      "bump-minor-pre-major": true
     }
   }
 }
