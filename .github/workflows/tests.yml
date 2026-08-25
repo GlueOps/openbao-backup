@@ -14,7 +14,7 @@ jobs:
       matrix:
         server: ["2.4.4", "2.6.1"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run e2e suite
         env:
           SERVER_IMAGE: openbao/openbao:${{ matrix.server }}
@@ -24,6 +24,6 @@ jobs:
     name: cross-version golden baseline
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run cross-version checks
         run: test/cross-version.sh
