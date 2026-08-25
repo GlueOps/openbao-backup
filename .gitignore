@@ -3,3 +3,5 @@ baokv.env
 !test/fixtures/*.json
 __pycache__/
 test/.xver-work/
+!release-please-config.json
+!.release-please-manifest.json
