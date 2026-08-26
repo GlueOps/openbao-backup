@@ -12,7 +12,7 @@ Every release publishes the image to GHCR. Pull the current release (the
 version below is rewritten automatically by release-please on every release):
 
 ```bash
-docker pull ghcr.io/glueops/openbao-backup:v0.1.0 # x-release-please-version
+docker pull ghcr.io/glueops/openbao-backup:v0.2.0 # x-release-please-version
 ```
 
 For local development, build with `docker build -t baokv .` and use `baokv`
@@ -44,7 +44,7 @@ read/written) and runs as your uid so files on the host belong to you.
 
 ```bash
 # Latest released image (this line is kept current by release-please)
-IMAGE=ghcr.io/glueops/openbao-backup:v0.1.0 # x-release-please-version
+IMAGE=ghcr.io/glueops/openbao-backup:v0.2.0 # x-release-please-version
 
 # Audit: every secret path, version, and key names — no values printed
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
