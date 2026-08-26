@@ -810,6 +810,14 @@ check("S19 every import is printed before the first delete",
       out.index("imported secret/protected") < out.index("deleted secret/doomed"),
       out)
 
+# ----------------------------------------------- T. no credential in argv
+print("== T. transport ==")
+src = open("/app/baokv.py").read()
+check("T1 the tool spawns no child processes, so no credential can reach argv",
+      "subprocess" not in src and "os.system" not in src and "os.exec" not in src)
+check("T2 the session cookie is sent as a request header",
+      'add_header("Cookie"' in src)
+
 # -------------------------------------------------------------------- report
 print()
 failed = [n for n, ok in results if not ok]
