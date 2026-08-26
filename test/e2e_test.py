@@ -640,6 +640,61 @@ check("Q4 list-denied subtree missing from dump but loudly warned",
       and "MISSING" in p.stdout + p.stderr, p.stderr)
 check("Q5 listable secrets still dumped", m.get("visible2", {}).get("data") == {"k": "v"})
 
+# ------------------------------------ R. dump-file and address guards
+print("== R. dump-file and address guards ==")
+reset_mount("secret")
+reset_mount("kv2b")
+put("secret", "guard", {"k": "v"})
+
+# dump must never write secrets onto a path someone else pre-created
+open("exists.json", "w").close()
+p = tool("dump", "-o", "exists.json")
+check("R1 dump refuses an existing output file",
+      p.returncode != 0 and "already exists" in p.stdout + p.stderr, p.stderr)
+check("R2 refused dump left the existing file untouched",
+      open("exists.json").read() == "")
+
+open("symlink-target.txt", "w").close()
+if os.path.lexists("link.json"):
+    os.unlink("link.json")
+os.symlink("symlink-target.txt", "link.json")
+p = tool("dump", "-o", "link.json")
+check("R3 dump refuses to write through a symlink", p.returncode != 0, p.stderr)
+check("R4 symlink target received no secrets",
+      open("symlink-target.txt").read() == "")
+
+os.makedirs("fakerepo/.git", exist_ok=True)
+p = tool("dump", "-o", "fakerepo/inside.json")
+check("R5 dump warns when the output is inside a git working tree",
+      p.returncode == 0 and "git working tree" in p.stdout + p.stderr, p.stderr)
+check("R6 dump inside a working tree still has mode 600",
+      os.stat("fakerepo/inside.json").st_mode & 0o777 == 0o600,
+      oct(os.stat("fakerepo/inside.json").st_mode))
+
+# a dump taken from one server must not be silently applied to another
+tool("dump", "-o", "addr.json")
+doc = json.load(open("addr.json"))
+doc["address"] = "https://some-other-server.example:8200"
+with open("addrmismatch.json", "w") as f:
+    json.dump(doc, f)
+p = tool("restore", "-i", "addrmismatch.json", "--yes")
+check("R7 restore refuses a dump from a different server",
+      p.returncode != 0 and "some-other-server.example" in p.stdout + p.stderr,
+      p.stdout + p.stderr)
+check("R8 refused restore changed nothing", get_data("secret", "guard") == {"k": "v"})
+p = tool("restore", "-i", "addrmismatch.json", "--dry-run",
+         "--allow-address-mismatch")
+check("R9 --allow-address-mismatch permits the cross-server restore",
+      p.returncode == 0, p.stdout + p.stderr)
+
+# cleartext transport must be called out, but not for the dev-server aliases
+p = tool("list", env={**FULL_ENV, "BAO_ADDR": "http://elsewhere.example:8200"})
+check("R10 non-https BAO_ADDR warns about cleartext",
+      "cleartext" in p.stdout + p.stderr, p.stderr)
+p = tool("list")
+check("R11 no cleartext warning for the dev-server alias",
+      "cleartext" not in p.stdout + p.stderr, p.stderr)
+
 # -------------------------------------------------------------------- report
 print()
 failed = [n for n, ok in results if not ok]

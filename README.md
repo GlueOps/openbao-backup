@@ -51,7 +51,7 @@ docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
   "$IMAGE" list
 
-# Export everything to a file (file is created with mode 600)
+# Export everything to a file (mode 600; refuses to overwrite an existing path)
 docker run --rm -e BAO_ADDR -e BAO_TOKEN -e BAO_COOKIE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" \
   "$IMAGE" dump -o secrets-export-$(date +%F-%H%M%S).json
@@ -80,7 +80,10 @@ Using an env file instead of exported variables: replace the three `-e` flags
 with `--env-file baokv.env`.
 
 Restore always audits the current server state first and prints the full plan
-(creates / overwrites / deletes) before touching anything.
+(creates / overwrites / deletes) before touching anything. It also refuses a
+dump whose recorded `address` is not the server you are pointing at, so a
+staging dump cannot be applied to production by accident — pass
+`--allow-address-mismatch` when a cross-server restore is what you want.
 
 ## Tests
 
@@ -147,7 +150,20 @@ server upgrade. Run this before bumping the pinned OpenBao version.
   restore aborts before making changes (mount creation is blocked by the
   proxy — create the mount manually first).
 - The dump file contains all secret values in plaintext. Treat it like a
-  credential. Dump/restore filenames are required to end in `.json` so they
-  always stay covered by the `*.json` rule in `.gitignore`. Note that env vars are
-  visible in `docker inspect` on a running container and in your shell
-  history if set inline — prefer `--env-file` with a mode-600 `baokv.env`.
+  credential. It is written with `O_EXCL`, so dump refuses to write onto any
+  path that already exists — including a symlink someone else placed there.
+  Give each dump a fresh name; the examples above timestamp it.
+- Dump/restore filenames must end in `.json`, which matches this repo's
+  `*.json` ignore rule, but a suffix cannot prove a path is ignored — other
+  repos have other rules, and negation rules exist. Dump warns when the output
+  lands inside a git working tree; confirm the path is ignored before you
+  commit anything.
+- `BAO_ADDR` is not forced to be https, because the test suites use a
+  disposable dev server over http. A non-https address that is not a loopback
+  or dev-server alias prints a warning: your token, your cookie and every
+  secret value cross the network in cleartext.
+- Env vars are visible in `docker inspect` on a running container and in your
+  shell history if set inline — prefer `--env-file` with a mode-600
+  `baokv.env`. The oauth2-proxy cookie is additionally passed on the `bao`
+  command line, so it is readable from `/proc` by anything sharing the
+  container's PID namespace.

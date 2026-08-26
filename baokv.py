@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.parse
 
 DUMP_FORMAT = "openbao-kvv2-dump-v1"
 
@@ -45,9 +46,19 @@ def cookie_header():
     return "Cookie=" + raw
 
 
+# hosts where cleartext is expected: the test suites run a disposable dev
+# server over http on a private docker network
+PLAINTEXT_OK = ("localhost", "127.0.0.1", "::1", "openbao")
+
+
 def setup_env():
-    os.environ["VAULT_ADDR"] = require_env(
-        "BAO_ADDR", "server URL, e.g. https://foobar.example.com")
+    addr = require_env("BAO_ADDR", "server URL, e.g. https://foobar.example.com")
+    host = urllib.parse.urlparse(addr).hostname or ""
+    if not addr.startswith("https://") and host not in PLAINTEXT_OK:
+        print(f"# WARNING: {addr} is not https — your token, your oauth2-proxy "
+              "cookie and every secret value will cross the network in "
+              "cleartext", file=sys.stderr)
+    os.environ["VAULT_ADDR"] = addr
     os.environ["VAULT_TOKEN"] = require_env("BAO_TOKEN", "your OpenBao token")
 
 
@@ -196,7 +207,18 @@ def cmd_dump(args):
         "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "mounts": data,
     }
-    fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    warn_if_in_git_worktree(args.output)
+    # O_EXCL: never write secrets into a path someone else pre-created (a
+    # symlink, a hard link, or a file they still hold an open fd on).
+    # O_NOFOLLOW: belt and braces, since O_EXCL already refuses symlinks.
+    try:
+        fd = os.open(args.output,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        sys.exit(f"error: {args.output} already exists — refusing to write "
+                 "secrets onto an existing path. Pick a new filename (the "
+                 "README's examples timestamp it) or remove the old file.")
+    os.fchmod(fd, 0o600)  # the mode above applies only on create
     with os.fdopen(fd, "w") as f:
         json.dump(doc, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -210,6 +232,12 @@ def cmd_restore(args):
         doc = json.load(f)
     if doc.get("format") != DUMP_FORMAT:
         sys.exit(f"error: {args.input} is not a {DUMP_FORMAT} file")
+    source = doc.get("address")
+    if source and source != os.environ["VAULT_ADDR"] and not args.allow_address_mismatch:
+        sys.exit(f"error: {args.input} was dumped from {source} but BAO_ADDR "
+                 f"is {os.environ['VAULT_ADDR']}. Restoring it here would make "
+                 "this server match a different server's contents. Pass "
+                 "--allow-address-mismatch if that is what you intend.")
 
     preflight()
     file_mounts = doc["mounts"]
@@ -266,12 +294,28 @@ def cmd_restore(args):
 
 
 def json_path(value):
-    # dump files hold plaintext secrets; forcing a .json suffix keeps them
-    # covered by the repo's *.json gitignore rule
     if not value.endswith(".json"):
-        raise argparse.ArgumentTypeError(
-            f"'{value}' must end in .json so dump files stay git-ignored")
+        raise argparse.ArgumentTypeError(f"'{value}' must end in .json")
     return value
+
+
+def warn_if_in_git_worktree(path):
+    """A dump holds every secret in plaintext. The .json suffix matches this
+    repo's `*.json` ignore rule, but a suffix cannot prove a path is ignored —
+    negation rules exist, and other repos have other rules. Say so out loud
+    rather than implying a guarantee (git is not in the image, so the ignore
+    rules cannot be evaluated here)."""
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            print(f"# WARNING: {path} is inside a git working tree ({d}). It "
+                  "will hold every secret in plaintext — confirm the path is "
+                  "git-ignored before committing anything.", file=sys.stderr)
+            return
+        parent = os.path.dirname(d)
+        if parent == d:
+            return
+        d = parent
 
 
 def main():
@@ -283,6 +327,8 @@ def main():
     p = sub.add_parser("restore", help="DESTRUCTIVE: make server match a dump file")
     p.add_argument("-i", "--input", required=True, type=json_path)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--allow-address-mismatch", action="store_true",
+                   help="restore a dump taken from a different BAO_ADDR")
     p.add_argument("--yes", action="store_true", help="skip confirmation prompt")
     args = ap.parse_args()
 

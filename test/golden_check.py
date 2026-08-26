@@ -29,7 +29,8 @@ def normalized(fname):
             for mt, secrets in mounts.items()}
 
 
-run("restore", "-i", restore_from, "--yes")
+# the golden fixture records a fictional source server on purpose
+run("restore", "-i", restore_from, "--yes", "--allow-address-mismatch")
 run("dump", "-o", out_path)
 g, d = normalized(golden_path), normalized(out_path)
 if g == d:

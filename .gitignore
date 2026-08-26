@@ -1,6 +1,6 @@
 baokv.env
 *.json
-!test/fixtures/*.json
+!test/fixtures/golden.json
 __pycache__/
 test/.xver-work/
 !release-please-config.json
