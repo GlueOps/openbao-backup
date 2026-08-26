@@ -18,6 +18,7 @@ Subcommands:
   restore -i secrets.json       # DESTRUCTIVE: make server match file
   restore -i secrets.json --dry-run
   restore -i secrets.json --yes
+  restore -i secrets.json --allow-incomplete --allow-mount-deletion
 """
 
 import argparse
@@ -63,6 +64,17 @@ def setup_env():
 
 
 last_error = None
+
+# Warnings that mean the RESULT IS MISSING DATA. A later restore reads absence
+# as "this secret should not exist" and deletes it, so this has to travel in
+# the dump file — a line on stderr is gone by the time a cron-produced file is
+# restored months later.
+incomplete_reasons = []
+
+
+def warn_incomplete(msg):
+    incomplete_reasons.append(msg)
+    print(f"#   WARNING: {msg}", file=sys.stderr)
 
 
 def bao(subcommand, *rest, stdin=None, check=True):
@@ -118,10 +130,9 @@ def walk(mount):
         out = bao_json("kv list", "-format=json", f"{mount}/{prefix}", check=False)
         if out is None and last_error and "permission denied" in last_error:
             # a silently-missing subtree would be DELETED by a later restore
-            print(f"#   WARNING: cannot list {mount}/{prefix} (permission "
-                  "denied) — this whole subtree is MISSING from the result; "
-                  "do not restore from a dump made with this token",
-                  file=sys.stderr)
+            warn_incomplete(f"cannot list {mount}/{prefix} (permission denied) "
+                            "— this whole subtree is MISSING from the result; "
+                            "do not restore from a dump made with this token")
         for entry in (out or []):
             if entry.endswith("/"):
                 stack.append(prefix + entry)
@@ -130,12 +141,19 @@ def walk(mount):
     return sorted(leaves)
 
 
+# A secret whose current version is soft-deleted or destroyed is an ordinary,
+# documented state, not a gap in what we were allowed to see. Marking those
+# dumps incomplete would make --allow-incomplete a permanent habit, and a flag
+# everyone always passes stops protecting anything.
+SOFT_DELETED = "soft-deleted"
+
+
 def read_secret(mount, path):
     out = bao_json("kv get", "-format=json", f"{mount}/{path}", check=False)
-    if out is None or out["data"]["data"] is None:
-        # unreadable, or current version soft-deleted/destroyed (the API
-        # then returns success with data: null)
-        return None
+    if out is None:
+        return None                       # unreadable: denied, or an error
+    if out["data"]["data"] is None:
+        return SOFT_DELETED               # success, but data: null
     meta = out["data"]["metadata"]
     return {
         "data": out["data"]["data"],
@@ -168,9 +186,15 @@ def collect(include_values):
         for path in walk(mount):
             if include_values:
                 s = read_secret(mount, path)
+                if s is SOFT_DELETED:
+                    print(f"#   WARNING: skipping {mount}/{path} (current "
+                          "version soft-deleted or destroyed) — a restore from "
+                          "this dump will remove it", file=sys.stderr)
+                    continue
                 if s is None:
-                    print(f"#   WARNING: skipping {mount}/{path} "
-                          "(current version deleted or unreadable)", file=sys.stderr)
+                    warn_incomplete(f"cannot read {mount}/{path} — it is "
+                                    "MISSING from the result and a restore "
+                                    "would DELETE it")
                     continue
                 if has_unsafe_number(s["data"]):
                     print(f"#   WARNING: {mount}/{path} contains a number at "
@@ -205,8 +229,12 @@ def cmd_dump(args):
         "format": DUMP_FORMAT,
         "address": os.environ["VAULT_ADDR"],
         "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "complete": not incomplete_reasons,
         "mounts": data,
     }
+    if incomplete_reasons:
+        doc["incomplete_count"] = len(incomplete_reasons)
+        doc["incomplete_reasons"] = incomplete_reasons[:20]
     warn_if_in_git_worktree(args.output)
     # O_EXCL: never write secrets into a path someone else pre-created (a
     # symlink, a hard link, or a file they still hold an open fd on).
@@ -224,6 +252,49 @@ def cmd_dump(args):
         f.write("\n")
     n = sum(len(s) for s in data.values())
     print(f"# wrote {n} secrets from {len(data)} mount(s) to {args.output}")
+    if incomplete_reasons:
+        print(f"# INCOMPLETE: {len(incomplete_reasons)} secret(s) or subtree(s) "
+              "could not be read. This dump is marked incomplete and restore "
+              "will refuse it — everything missing here would be DELETED by a "
+              "restore. Re-dump with a token that can read and list "
+              "everything.", file=sys.stderr)
+
+
+def check_capabilities(to_write, to_delete):
+    """Confirm the token may perform every operation in the plan before any of
+    it runs. sys/capabilities-self is a pure read — no canary is written into
+    the target mounts."""
+    need = {}
+    for mount, path, _ in to_write:
+        need[f"{mount}/data/{path}"] = {"create", "update"}   # either suffices
+        need[f"{mount}/metadata/{path}"] = {"delete"}         # wipes history
+    for mount, path in to_delete:
+        need[f"{mount}/metadata/{path}"] = {"delete"}
+    if not need:
+        return
+    paths, denied = sorted(need), []
+    for i in range(0, len(paths), 100):
+        chunk = paths[i:i + 100]
+        out = bao_json("write", "-format=json", "sys/capabilities-self",
+                       *[f"paths={p}" for p in chunk], check=False)
+        if out is None:
+            # advisory only: the reordering below is what prevents data loss
+            print("# WARNING: could not check token capabilities "
+                  f"({last_error}) — proceeding without the pre-check",
+                  file=sys.stderr)
+            return
+        for p in chunk:
+            got = set(out["data"].get(p) or [])
+            if not ({"root", "sudo"} & got) and not (need[p] & got):
+                denied.append(f"{p} (need one of {sorted(need[p])}, have "
+                              f"{sorted(got) or ['nothing']})")
+    if denied:
+        shown = "\n  ".join(denied[:10])
+        more = f"\n  ... and {len(denied) - 10} more" if len(denied) > 10 else ""
+        sys.exit(f"error: this token cannot carry out the whole plan, so the "
+                 f"restore would stop part-way through:\n  {shown}{more}\n"
+                 "Nothing has been changed. Re-run with a token that covers "
+                 "every path above.")
 
 
 def cmd_restore(args):
@@ -232,6 +303,16 @@ def cmd_restore(args):
         doc = json.load(f)
     if doc.get("format") != DUMP_FORMAT:
         sys.exit(f"error: {args.input} is not a {DUMP_FORMAT} file")
+    # A missing "complete" key means a dump written before this field existed;
+    # those cannot be judged, so they are allowed through.
+    if doc.get("complete") is False and not args.allow_incomplete:
+        reasons = "\n  ".join(doc.get("incomplete_reasons") or ["(not recorded)"])
+        sys.exit(f"error: {args.input} is marked INCOMPLETE — "
+                 f"{doc.get('incomplete_count', '?')} secret(s) or subtree(s) "
+                 "could not be read when it was made:\n  "
+                 f"{reasons}\nRestoring it would DELETE every one of them "
+                 "from the server. Re-dump with a token that can read and list "
+                 "everything, or pass --allow-incomplete.")
     source = doc.get("address")
     if source and source != os.environ["VAULT_ADDR"] and not args.allow_address_mismatch:
         sys.exit(f"error: {args.input} was dumped from {source} but BAO_ADDR "
@@ -250,7 +331,28 @@ def cmd_restore(args):
 
     # Audit current server state before touching anything.
     print("# auditing current server state ...", file=sys.stderr)
+    audit_start = len(incomplete_reasons)
     server_state = {m: walk(m) for m in server_mounts}
+    if len(incomplete_reasons) > audit_start:
+        print("# WARNING: parts of the server could not be listed during the "
+              "audit, so the plan below may be missing entries", file=sys.stderr)
+
+    # A mount the FILE has no entry for is not a mount the file says is empty.
+    # `sys/internal/ui/mounts` is filtered by the dumping token's policy, so a
+    # mount that token could not see is simply absent — and treating absent as
+    # empty deletes every secret in it, permanently, with no warning.
+    absent = [m for m in server_mounts if m not in doc["mounts"]]
+    if absent and not args.allow_mount_deletion:
+        detail = "\n  ".join(
+            f"{m}/ ({len(server_state[m])} secret"
+            f"{'' if len(server_state[m]) == 1 else 's'})" for m in absent)
+        sys.exit(f"error: these kv-v2 mounts exist on the server but are "
+                 f"absent from {args.input}:\n  {detail}\n"
+                 "The file has no opinion about them, which is not the same as "
+                 "saying they should be empty — the dump may have been made "
+                 "with a token that could not see them. Every secret in them "
+                 "would be permanently deleted. Re-dump with a token that "
+                 "covers every mount, or pass --allow-mount-deletion.")
 
     to_delete, to_write = [], []
     for mount, paths in server_state.items():
@@ -268,6 +370,8 @@ def cmd_restore(args):
     for m, p in to_delete:
         print(f"    - {m}/{p}")
 
+    check_capabilities(to_write, to_delete)
+
     if args.dry_run:
         print("\n# dry run: no changes made")
         return
@@ -276,21 +380,44 @@ def cmd_restore(args):
         if reply.strip() != "yes":
             sys.exit("aborted, no changes made")
 
-    for mount, path in to_delete:
-        bao("kv metadata delete", f"{mount}/{path}")
-        print(f"deleted {mount}/{path}")
-    for mount, path, s in to_write:
-        # metadata delete wipes old versions so the imported state is clean;
-        # -cas=0 is then always valid and keeps restore working on mounts
-        # with cas_required=true
-        bao("kv metadata delete", f"{mount}/{path}", check=False)
-        bao("kv put", "-cas=0", f"{mount}/{path}", "-",
-            stdin=json.dumps(s["data"]))
-        if s.get("custom_metadata"):
-            bao("write", f"{mount}/metadata/{path}", "-",
-                stdin=json.dumps({"custom_metadata": s["custom_metadata"]}))
-        print(f"imported {mount}/{path}")
-    print(f"\n# done: {len(to_write)} imported, {len(to_delete)} deleted")
+    # Writes first, deletions last. Everything the write phase touches is
+    # present in the file, so an abort there is recoverable by re-running.
+    # Deletions remove data that is NOT in the file and nothing can bring it
+    # back, so they must not run until every write has succeeded.
+    written = deleted = 0
+    phase = "write"
+    try:
+        for mount, path, s in to_write:
+            # metadata delete wipes old versions so the imported state is
+            # clean; -cas=0 is then always valid and keeps restore working on
+            # mounts with cas_required=true
+            bao("kv metadata delete", f"{mount}/{path}", check=False)
+            bao("kv put", "-cas=0", f"{mount}/{path}", "-",
+                stdin=json.dumps(s["data"]))
+            if s.get("custom_metadata"):
+                bao("write", f"{mount}/metadata/{path}", "-",
+                    stdin=json.dumps({"custom_metadata": s["custom_metadata"]}))
+            written += 1
+            print(f"imported {mount}/{path}")
+        phase = "delete"
+        for mount, path in to_delete:
+            bao("kv metadata delete", f"{mount}/{path}")
+            deleted += 1
+            print(f"deleted {mount}/{path}")
+    except SystemExit:
+        if phase == "write":
+            print(f"\n# ABORTED during the write phase: {written}/{len(to_write)} "
+                  f"imported, none of the {len(to_delete)} deletions attempted. "
+                  "Nothing outside the file was touched — every secret affected "
+                  f"so far is present in {args.input}, so re-running the same "
+                  "restore recovers it.", file=sys.stderr)
+        else:
+            print(f"\n# ABORTED during the delete phase: all {written} writes "
+                  f"succeeded, {deleted}/{len(to_delete)} deletions done. The "
+                  "remaining deletions did not run; re-run the same restore to "
+                  "finish.", file=sys.stderr)
+        raise
+    print(f"\n# done: {written} imported, {deleted} deleted")
 
 
 def json_path(value):
@@ -329,6 +456,11 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--allow-address-mismatch", action="store_true",
                    help="restore a dump taken from a different BAO_ADDR")
+    p.add_argument("--allow-incomplete", action="store_true",
+                   help="restore a dump marked incomplete (DELETES everything "
+                        "the dump could not read)")
+    p.add_argument("--allow-mount-deletion", action="store_true",
+                   help="empty kv-v2 mounts the dump file does not mention")
     p.add_argument("--yes", action="store_true", help="skip confirmation prompt")
     args = ap.parse_args()
 

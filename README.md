@@ -80,10 +80,22 @@ Using an env file instead of exported variables: replace the three `-e` flags
 with `--env-file baokv.env`.
 
 Restore always audits the current server state first and prints the full plan
-(creates / overwrites / deletes) before touching anything. It also refuses a
-dump whose recorded `address` is not the server you are pointing at, so a
-staging dump cannot be applied to production by accident — pass
-`--allow-address-mismatch` when a cross-server restore is what you want.
+(creates / overwrites / deletes) before touching anything. It refuses to
+act on a dump it cannot trust to be a full picture, and each refusal has an
+explicit opt-out:
+
+| Restore refuses when | Why | Opt out with |
+|----------------------|-----|--------------|
+| the recorded `address` is not the server you are pointing at | a staging dump applied to production would wipe it to match | `--allow-address-mismatch` |
+| a kv-v2 mount exists on the server but the file never mentions it | mount discovery is filtered by the *dumping* token's policy, so an absent mount may just be one that token could not see — and every secret in it would be permanently deleted | `--allow-mount-deletion` |
+| the file is marked `"complete": false` | something could not be read when the dump was made, and restoring would delete exactly those secrets | `--allow-incomplete` |
+| the token cannot carry out every operation in the plan | the restore would stop part-way through | — (use a token that can) |
+
+Writes run before deletions, so an interrupted restore — an expired cookie
+part-way through a long run is the usual cause — leaves extra secrets behind
+rather than missing ones. Everything the write phase touches is in the file, so
+re-running the same restore recovers it; deletions remove data that is *not* in
+the file and nothing can bring it back, which is why they go last.
 
 ## Tests
 
@@ -136,11 +148,23 @@ server upgrade. Run this before bumping the pinned OpenBao version.
   `custom_metadata`. Older versions are not exported, and restore resets each
   secret's history to version 1.
 - Secrets whose current version is (soft-)deleted are skipped with a warning
-  during dump — and will therefore be **removed** by a later restore.
-- The same applies to secrets your token cannot read or list: dump warns
-  about unreadable secrets and un-listable subtrees, and both would be
-  **deleted** if you restored from that partial dump. Always dump with a
-  token that can read and list everything you intend to keep.
+  during dump — and will therefore be **removed** by a later restore. This is
+  an ordinary KV state rather than a gap in what the token could see, so it
+  does **not** mark the dump incomplete; if it did, any store holding one
+  soft-deleted secret would need `--allow-incomplete` forever, and a flag you
+  always pass protects nothing.
+- Secrets your token cannot **read**, and subtrees it cannot **list**, are a
+  different matter: dump warns, records `"complete": false` in the file along
+  with the reasons, and restore then refuses that file. Absence in a dump means
+  "delete this" to a restore, so the fact that something was missed has to
+  travel in the file — a warning on stderr is gone by the time a cron-produced
+  dump is restored months later.
+- A mount your token cannot see at all is the one case dump **cannot** detect:
+  `sys/internal/ui/mounts` is filtered by policy, so the mount is simply not
+  there, and the dump is honestly complete as far as it can tell. That gap is
+  closed on the restore side instead — restore refuses to empty a mount the
+  file never mentions. Still, dump with a token that can read and list
+  everything you intend to keep.
 - Numbers at or above 2^53 (e.g. int64 max) are rounded to float64 precision
   by OpenBao itself — even when written through the raw HTTP API, the exact
   value is never observable again, so dump/restore cannot make it worse.
