@@ -3,7 +3,7 @@
 
 Runs INSIDE a docker image (openbao + python3) — the only local dependency
 is the docker CLI. The `bao` binary in the image makes all API calls; an
-oauth2-proxy cookie is injected on every request via `bao -header`. Mount a
+oauth2-proxy cookie is sent as a request header on every call. Mount a
 host directory at /work for dump files. See README.md for the full
 `docker run` commands.
 
@@ -25,26 +25,28 @@ import argparse
 import datetime
 import json
 import os
-import subprocess
+import ssl
 import sys
+import urllib.error
 import urllib.parse
+import urllib.request
 
 DUMP_FORMAT = "openbao-kvv2-dump-v1"
 
 
 def require_env(name, hint):
     value = os.environ.get(name, "").strip()
-    if not value or "REPLACE_WITH" in value:
+    if not value or value.startswith("REPLACE_WITH"):
         sys.exit(f"error: set the {name} env var ({hint}) — "
                  "pass it with docker run -e or --env-file")
     return value
 
 
-def cookie_header():
+def cookie_value():
     raw = require_env("BAO_COOKIE", "your _oauth2_proxy cookie value")
     if not raw.startswith("_oauth2_proxy="):
         raw = "_oauth2_proxy=" + raw
-    return "Cookie=" + raw
+    return raw
 
 
 # hosts where cleartext is expected: the test suites run a disposable dev
@@ -64,6 +66,7 @@ def setup_env():
 
 
 last_error = None
+last_status = None
 
 # Warnings that mean the RESULT IS MISSING DATA. A later restore reads absence
 # as "this secret should not exist" and deletes it, so this has to travel in
@@ -77,44 +80,113 @@ def warn_incomplete(msg):
     print(f"#   WARNING: {msg}", file=sys.stderr)
 
 
-def bao(subcommand, *rest, stdin=None, check=True):
-    """Run a bao subcommand; inject the oauth2 cookie.
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The oauth2-proxy answers an expired session with a redirect to the OAuth
+    login. Following it would fetch an HTML page and fail later with a confusing
+    JSON error, so refuse the redirect and let it surface as an HTTPError."""
 
-    `subcommand` is the full space-separated command ("kv metadata delete");
-    the -header flag must come after it but before positional args.
-    """
-    global last_error
-    cmd = (["bao"] + subcommand.split()
-           + [f"-header={cookie_header()}"] + list(rest))
-    p = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
-    last_error = None if p.returncode == 0 else (p.stderr or p.stdout).strip()
-    if p.returncode != 0:
-        err = last_error
-        if "Redirecting" in err or "302" in err:
-            sys.exit("error: got an OAuth redirect — your _oauth2_proxy "
-                     "cookie has likely expired. Grab a fresh one from your "
-                     "browser and update the BAO_COOKIE env var")
-        if check:
-            sys.exit(f"error: bao {subcommand}: {err}")
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
-    return p.stdout
 
 
-def bao_json(*args, **kw):
-    out = bao(*args, **kw)
-    return json.loads(out) if out else None
+_opener = None
+
+
+def opener():
+    global _opener
+    if _opener is None:
+        ctx = ssl.create_default_context(
+            cafile=os.environ.get("BAO_CACERT") or None)
+        _opener = urllib.request.build_opener(
+            NoRedirect, urllib.request.HTTPSHandler(context=ctx))
+    return _opener
+
+
+def enc(path):
+    """Percent-encode a KV path for a URL. `/` stays a separator; everything
+    else is escaped, including a literal `%` (so a secret actually named
+    `%2F` survives as `%252F` rather than decoding back into a separator)."""
+    return urllib.parse.quote(path, safe="/")
+
+
+def expired_cookie():
+    sys.exit("error: got an OAuth redirect — your _oauth2_proxy cookie has "
+             "likely expired. Grab a fresh one from your browser and update "
+             "the BAO_COOKIE env var")
+
+
+def api(method, path, body=None, check=True):
+    """One OpenBao HTTP call. `path` is everything after /v1/, already
+    percent-encoded. Returns the decoded JSON body, or None on a handled
+    failure when check is False.
+
+    The token and the session cookie travel as request headers. They used to
+    be `bao -header=Cookie=...` on the command line, where anything sharing
+    the container's PID namespace could read them out of /proc.
+    """
+    global last_error, last_status
+    url = f"{os.environ['VAULT_ADDR'].rstrip('/')}/v1/{path}"
+    req = urllib.request.Request(
+        url, method=method,
+        data=json.dumps(body).encode() if body is not None else None)
+    req.add_header("X-Vault-Token", os.environ["VAULT_TOKEN"])
+    req.add_header("Cookie", cookie_value())
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+
+    try:
+        with opener().open(req) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        last_status = e.code
+        if e.code in (301, 302, 303, 307, 308):
+            expired_cookie()
+        raw = e.read()
+        try:
+            doc = json.loads(raw) if raw else None
+        except ValueError:
+            doc = None
+        # kv-v2 answers 404 for a soft-deleted or destroyed current version,
+        # but with the real envelope attached (data.data is null). That is not
+        # a failure — the caller needs to see it to tell the two apart.
+        if e.code == 404 and isinstance(doc, dict) and doc.get("data") is not None:
+            last_error = None
+            return doc
+        errors = (doc or {}).get("errors") or []
+        last_error = "; ".join(errors) or f"HTTP {e.code}"
+        if check:
+            sys.exit(f"error: {method} {path}: {last_error}")
+        return None
+    except urllib.error.URLError as e:
+        last_status = None                # never reached the server
+        last_error = str(getattr(e, "reason", e))
+        if check:
+            sys.exit(f"error: {method} {path}: cannot reach "
+                     f"{os.environ['VAULT_ADDR']}: {last_error}")
+        return None
+
+    last_error, last_status = None, 200
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        # a proxy that serves its login page with a 200 rather than a redirect
+        expired_cookie()
 
 
 def preflight():
-    info = bao_json("token lookup", "-format=json")
-    d = info["data"]
+    d = (api("GET", "auth/token/lookup-self") or {}).get("data") or {}
+    if not d:
+        sys.exit("error: token lookup returned no data — is BAO_TOKEN a valid "
+                 "token for this server?")
     expires = (d.get("expire_time") or "never")[:10]
     print(f"# auth ok: {d.get('display_name')} policies={d.get('policies')} "
           f"token expires {expires}", file=sys.stderr)
 
 
 def kvv2_mounts():
-    out = bao_json("read", "-format=json", "sys/internal/ui/mounts")
+    out = api("GET", "sys/internal/ui/mounts")
     mounts = []
     for path, info in sorted(out["data"]["secret"].items()):
         if info.get("type") == "kv" and (info.get("options") or {}).get("version") == "2":
@@ -127,13 +199,17 @@ def walk(mount):
     leaves, stack = [], [""]
     while stack:
         prefix = stack.pop()
-        out = bao_json("kv list", "-format=json", f"{mount}/{prefix}", check=False)
-        if out is None and last_error and "permission denied" in last_error:
-            # a silently-missing subtree would be DELETED by a later restore
-            warn_incomplete(f"cannot list {mount}/{prefix} (permission denied) "
-                            "— this whole subtree is MISSING from the result; "
-                            "do not restore from a dump made with this token")
-        for entry in (out or []):
+        out = api("GET", f"{enc(mount)}/metadata/{enc(prefix)}?list=true",
+                  check=False)
+        # 404 is how kv-v2 says "nothing here", which is a real answer. Every
+        # other failure — denied, a 5xx, a connection reset mid-walk — leaves a
+        # subtree looking empty when it is not, and a later restore reads that
+        # as "delete all of it". Only 404 may pass without a warning.
+        if out is None and last_status != 404:
+            warn_incomplete(f"cannot list {mount}/{prefix} ({last_error}) — "
+                            "this whole subtree is MISSING from the result and "
+                            "a restore from this dump would DELETE it")
+        for entry in ((out or {}).get("data") or {}).get("keys") or []:
             if entry.endswith("/"):
                 stack.append(prefix + entry)
             else:
@@ -149,8 +225,8 @@ SOFT_DELETED = "soft-deleted"
 
 
 def read_secret(mount, path):
-    out = bao_json("kv get", "-format=json", f"{mount}/{path}", check=False)
-    if out is None:
+    out = api("GET", f"{enc(mount)}/data/{enc(path)}", check=False)
+    if out is None or out.get("data") is None:
         return None                       # unreadable: denied, or an error
     if out["data"]["data"] is None:
         return SOFT_DELETED               # success, but data: null
@@ -164,9 +240,10 @@ def read_secret(mount, path):
 
 
 def has_unsafe_number(v):
-    """True if any number in v needs more precision than float64 offers —
-    the bao CLI decodes JSON numbers as float64, so such values may already
-    have been rounded and cannot be trusted bit-for-bit."""
+    """True if any number in v needs more precision than float64 offers.
+    OpenBao itself decodes JSON numbers into float64, so such values have
+    already been rounded server-side and cannot be recovered — reading them
+    over the raw HTTP API does not help (test Q measures exactly this)."""
     if isinstance(v, bool):
         return False
     if isinstance(v, (int, float)):
@@ -178,39 +255,37 @@ def has_unsafe_number(v):
     return False
 
 
-def collect(include_values):
+def collect():
+    """Read every secret in every visible kv-v2 mount. `list` needs the values
+    too — it prints key names, not values — so there is no cheaper mode."""
     result = {}
     for mount in kvv2_mounts():
         print(f"# walking {mount}/ ...", file=sys.stderr)
         secrets = {}
         for path in walk(mount):
-            if include_values:
-                s = read_secret(mount, path)
-                if s is SOFT_DELETED:
-                    print(f"#   WARNING: skipping {mount}/{path} (current "
-                          "version soft-deleted or destroyed) — a restore from "
-                          "this dump will remove it", file=sys.stderr)
-                    continue
-                if s is None:
-                    warn_incomplete(f"cannot read {mount}/{path} — it is "
-                                    "MISSING from the result and a restore "
-                                    "would DELETE it")
-                    continue
-                if has_unsafe_number(s["data"]):
-                    print(f"#   WARNING: {mount}/{path} contains a number at "
-                          "or above 2^53 — the bao CLI rounds such values to "
-                          "float64, so it may not round-trip exactly; store "
-                          "huge numbers as strings", file=sys.stderr)
-                secrets[path] = s
-            else:
-                secrets[path] = None
+            s = read_secret(mount, path)
+            if s is SOFT_DELETED:
+                print(f"#   WARNING: skipping {mount}/{path} (current version "
+                      "soft-deleted or destroyed) — a restore from this dump "
+                      "will remove it", file=sys.stderr)
+                continue
+            if s is None:
+                warn_incomplete(f"cannot read {mount}/{path} — it is MISSING "
+                                "from the result and a restore would DELETE it")
+                continue
+            if has_unsafe_number(s["data"]):
+                print(f"#   WARNING: {mount}/{path} contains a number at or "
+                      "above 2^53 — OpenBao stores such values as float64, so "
+                      "the exact value is already gone; store huge numbers as "
+                      "strings", file=sys.stderr)
+            secrets[path] = s
         result[mount] = secrets
     return result
 
 
 def cmd_list(_args):
     preflight()
-    data = collect(include_values=True)
+    data = collect()
     total = 0
     for mount, secrets in data.items():
         print(f"{mount}/  ({len(secrets)} secrets)")
@@ -224,7 +299,7 @@ def cmd_list(_args):
 
 def cmd_dump(args):
     preflight()
-    data = collect(include_values=True)
+    data = collect()
     doc = {
         "format": DUMP_FORMAT,
         "address": os.environ["VAULT_ADDR"],
@@ -275,8 +350,8 @@ def check_capabilities(to_write, to_delete):
     paths, denied = sorted(need), []
     for i in range(0, len(paths), 100):
         chunk = paths[i:i + 100]
-        out = bao_json("write", "-format=json", "sys/capabilities-self",
-                       *[f"paths={p}" for p in chunk], check=False)
+        out = api("POST", "sys/capabilities-self", {"paths": chunk},
+                  check=False)
         if out is None:
             # advisory only: the reordering below is what prevents data loss
             print("# WARNING: could not check token capabilities "
@@ -391,17 +466,17 @@ def cmd_restore(args):
             # metadata delete wipes old versions so the imported state is
             # clean; -cas=0 is then always valid and keeps restore working on
             # mounts with cas_required=true
-            bao("kv metadata delete", f"{mount}/{path}", check=False)
-            bao("kv put", "-cas=0", f"{mount}/{path}", "-",
-                stdin=json.dumps(s["data"]))
+            api("DELETE", f"{enc(mount)}/metadata/{enc(path)}", check=False)
+            api("POST", f"{enc(mount)}/data/{enc(path)}",
+                {"data": s["data"], "options": {"cas": 0}})
             if s.get("custom_metadata"):
-                bao("write", f"{mount}/metadata/{path}", "-",
-                    stdin=json.dumps({"custom_metadata": s["custom_metadata"]}))
+                api("POST", f"{enc(mount)}/metadata/{enc(path)}",
+                    {"custom_metadata": s["custom_metadata"]})
             written += 1
             print(f"imported {mount}/{path}")
         phase = "delete"
         for mount, path in to_delete:
-            bao("kv metadata delete", f"{mount}/{path}")
+            api("DELETE", f"{enc(mount)}/metadata/{enc(path)}")
             deleted += 1
             print(f"deleted {mount}/{path}")
     except SystemExit:

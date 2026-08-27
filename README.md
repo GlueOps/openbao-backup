@@ -2,9 +2,9 @@
 
 Exports and imports **all KV v2 secrets** of an OpenBao instance. Everything
 runs inside a docker image (`openbao/openbao` + python3) — the only local
-dependency is the docker CLI. The `bao` CLI inside the container makes all
-API calls; the oauth2-proxy cookie is injected on every request via
-`bao -header="Cookie=..."`.
+dependency is the docker CLI. The tool talks to the OpenBao HTTP API directly
+from the stdlib; the token and the oauth2-proxy cookie are sent as request
+headers, so neither ever appears on a command line.
 
 ## Get the image
 
@@ -25,6 +25,7 @@ in place of the image reference below (the test suites always build locally).
 | `BAO_ADDR`   | Server URL, e.g. `https://foobar.example.com`                          |
 | `BAO_TOKEN`  | Your OpenBao token (e.g. from the OIDC login)                          |
 | `BAO_COOKIE` | The `_oauth2_proxy` cookie value from your browser dev tools, with or without the `_oauth2_proxy=` prefix |
+| `BAO_CACERT` | *Optional.* Path (inside the container) to a CA bundle, if the server presents a certificate from an internal CA |
 
 Pass them with `-e` flags, or copy `baokv.env.example` to `baokv.env`
 (git-ignored), fill it in, and use `--env-file baokv.env`. The tool exits
@@ -142,6 +143,10 @@ server upgrade. Run this before bumping the pinned OpenBao version.
 
 ## Notes / limitations
 
+- `list` prints no values, but it still reads every secret to get the key
+  names — so it produces exactly the same per-secret read audit-log entries as
+  `dump`, and pulls the same plaintext over the wire. It is an audit of what
+  exists, not a cheaper or quieter call.
 - Only KV v2 mounts are handled (all of them are auto-discovered via
   `sys/internal/ui/mounts`; the oauth proxy blocks `/v1/sys/mounts`).
 - The dump stores the **current version** of each secret plus its
@@ -188,6 +193,6 @@ server upgrade. Run this before bumping the pinned OpenBao version.
   secret value cross the network in cleartext.
 - Env vars are visible in `docker inspect` on a running container and in your
   shell history if set inline — prefer `--env-file` with a mode-600
-  `baokv.env`. The oauth2-proxy cookie is additionally passed on the `bao`
-  command line, so it is readable from `/proc` by anything sharing the
-  container's PID namespace.
+  `baokv.env`. Neither the token nor the cookie reaches a command line: the
+  tool spawns no child processes at all, so there is no `/proc/<pid>/cmdline`
+  for anything sharing the container's PID namespace to read.
