@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/GlueOps/openbao-backup/compare/v0.2.0...v0.2.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* close dump-file and restore-target safety gaps ([#20](https://github.com/GlueOps/openbao-backup/issues/20)) ([4464598](https://github.com/GlueOps/openbao-backup/commit/446459854e2df91a9503b8bf4ff3a5c9a016d4aa))
+
+
+### Miscellaneous Chores
+
+* **patch:** update docker/login-action to v4.5.2 #patch ([#24](https://github.com/GlueOps/openbao-backup/issues/24)) ([e23f759](https://github.com/GlueOps/openbao-backup/commit/e23f7595223ae0731f68ca43818586cfad1db5f9))
+
 ## [0.2.0](https://github.com/GlueOps/openbao-backup/compare/v0.1.0...v0.2.0) (2026-08-26)
 
 
