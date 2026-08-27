@@ -640,6 +640,236 @@ check("Q4 list-denied subtree missing from dump but loudly warned",
       and "MISSING" in p.stdout + p.stderr, p.stderr)
 check("Q5 listable secrets still dumped", m.get("visible2", {}).get("data") == {"k": "v"})
 
+# ------------------------------------ R. dump-file and address guards
+print("== R. dump-file and address guards ==")
+reset_mount("secret")
+reset_mount("kv2b")
+put("secret", "guard", {"k": "v"})
+
+# dump must never write secrets onto a path someone else pre-created
+open("exists.json", "w").close()
+p = tool("dump", "-o", "exists.json")
+check("R1 dump refuses an existing output file",
+      p.returncode != 0 and "already exists" in p.stdout + p.stderr, p.stderr)
+check("R2 refused dump left the existing file untouched",
+      open("exists.json").read() == "")
+
+open("symlink-target.txt", "w").close()
+if os.path.lexists("link.json"):
+    os.unlink("link.json")
+os.symlink("symlink-target.txt", "link.json")
+p = tool("dump", "-o", "link.json")
+check("R3 dump refuses to write through a symlink", p.returncode != 0, p.stderr)
+check("R4 symlink target received no secrets",
+      open("symlink-target.txt").read() == "")
+
+os.makedirs("fakerepo/.git", exist_ok=True)
+p = tool("dump", "-o", "fakerepo/inside.json")
+check("R5 dump warns when the output is inside a git working tree",
+      p.returncode == 0 and "git working tree" in p.stdout + p.stderr, p.stderr)
+check("R6 dump inside a working tree still has mode 600",
+      os.stat("fakerepo/inside.json").st_mode & 0o777 == 0o600,
+      oct(os.stat("fakerepo/inside.json").st_mode))
+
+# a dump taken from one server must not be silently applied to another
+tool("dump", "-o", "addr.json")
+doc = json.load(open("addr.json"))
+doc["address"] = "https://some-other-server.example:8200"
+with open("addrmismatch.json", "w") as f:
+    json.dump(doc, f)
+p = tool("restore", "-i", "addrmismatch.json", "--yes")
+check("R7 restore refuses a dump from a different server",
+      p.returncode != 0 and "some-other-server.example" in p.stdout + p.stderr,
+      p.stdout + p.stderr)
+check("R8 refused restore changed nothing", get_data("secret", "guard") == {"k": "v"})
+p = tool("restore", "-i", "addrmismatch.json", "--dry-run",
+         "--allow-address-mismatch")
+check("R9 --allow-address-mismatch permits the cross-server restore",
+      p.returncode == 0, p.stdout + p.stderr)
+
+# cleartext transport must be called out, but not for the dev-server aliases
+p = tool("list", env={**FULL_ENV, "BAO_ADDR": "http://elsewhere.example:8200"})
+check("R10 non-https BAO_ADDR warns about cleartext",
+      "cleartext" in p.stdout + p.stderr, p.stderr)
+p = tool("list")
+check("R11 no cleartext warning for the dev-server alias",
+      "cleartext" not in p.stdout + p.stderr, p.stderr)
+
+# ------------------- S. absent mounts, incomplete dumps, restore ordering
+print("== S. absent mounts, incomplete dumps, restore ordering ==")
+reset_mount("secret")
+reset_mount("kv2b")
+put("secret", "kept", {"k": "v"})
+put("kv2b", "critical-prod-creds", {"k": "v"})
+
+# a token that cannot SEE a mount produces a dump that simply omits it:
+# sys/internal/ui/mounts is filtered by policy, so this is undetectable at
+# dump time — which is exactly why the guard has to live in restore
+POLICY3 = '''
+path "secret/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+'''
+p = bao("policy", "write", "onemount", "-", stdin=POLICY3)
+assert p.returncode == 0, p.stderr
+p = bao("token", "create", "-policy=onemount", "-policy=default", "-format=json")
+onemount_token = json.loads(p.stdout)["auth"]["client_token"]
+p = tool("dump", "-o", "onemount.json", env={**FULL_ENV, "BAO_TOKEN": onemount_token})
+doc = json.load(open("onemount.json"))
+check("S1 a mount the token cannot see is silently absent from the dump",
+      p.returncode == 0 and list(doc["mounts"]) == ["secret"], list(doc["mounts"]))
+check("S2 and that dump still marks itself complete (undetectable at dump time)",
+      doc["complete"] is True, doc.get("complete"))
+
+p = tool("restore", "-i", "onemount.json", "--yes")
+check("S3 restore refuses to empty a mount the file never mentions",
+      p.returncode != 0 and "kv2b" in p.stdout + p.stderr, p.stdout + p.stderr)
+check("S4 the refused restore destroyed nothing",
+      get_data("kv2b", "critical-prod-creds") == {"k": "v"})
+p = tool("restore", "-i", "onemount.json", "--yes", "--allow-mount-deletion")
+check("S5 --allow-mount-deletion still permits it", p.returncode == 0, p.stderr)
+check("S6 and then the mount really is emptied",
+      get_data("kv2b", "critical-prod-creds") is None)
+
+# an unreadable secret makes the dump incomplete, and that travels in the file
+reset_mount("secret")
+reset_mount("kv2b")
+put("secret", "visible3", {"k": "v"})
+put("secret", "hidden2/topsecret", {"k": "v"})
+p = tool("dump", "-o", "full.json")
+check("S7 a clean dump marks itself complete",
+      json.load(open("full.json"))["complete"] is True)
+POLICY4 = '''
+path "secret/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "kv2b/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "secret/data/hidden2/*" { capabilities = ["deny"] }
+'''
+p = bao("policy", "write", "partial", "-", stdin=POLICY4)
+assert p.returncode == 0, p.stderr
+p = bao("token", "create", "-policy=partial", "-policy=default", "-format=json")
+partial_token = json.loads(p.stdout)["auth"]["client_token"]
+p = tool("dump", "-o", "partial.json", env={**FULL_ENV, "BAO_TOKEN": partial_token})
+doc = json.load(open("partial.json"))
+check("S8 a partial dump records complete=false and why",
+      doc["complete"] is False and doc["incomplete_count"] == 1
+      and "hidden2/topsecret" in " ".join(doc["incomplete_reasons"]), doc.get("incomplete_reasons"))
+check("S9 dump still exits 0 and says so loudly",
+      p.returncode == 0 and "INCOMPLETE" in p.stdout + p.stderr, p.stderr)
+p = tool("restore", "-i", "partial.json", "--yes")
+check("S10 restore refuses a dump marked incomplete",
+      p.returncode != 0 and "INCOMPLETE" in p.stdout + p.stderr, p.stdout + p.stderr)
+check("S11 the refused restore destroyed nothing",
+      get_data("secret", "hidden2/topsecret") == {"k": "v"})
+p = tool("restore", "-i", "partial.json", "--yes", "--allow-incomplete")
+check("S12 --allow-incomplete permits it", p.returncode == 0, p.stderr)
+check("S13 and then the unreadable secret really is deleted",
+      get_data("secret", "hidden2/topsecret") is None)
+
+# dumps written before the field existed cannot be judged, so they are allowed
+doc = json.load(open("full.json"))
+del doc["complete"]
+with open("legacy.json", "w") as f:
+    json.dump(doc, f)
+p = tool("restore", "-i", "legacy.json", "--yes")
+check("S14 a dump with no completeness field is still restorable",
+      p.returncode == 0, p.stdout + p.stderr)
+
+# the token must be able to finish the plan before any of it runs
+reset_mount("secret")
+reset_mount("kv2b")
+put("secret", "protected", {"k": "original"})
+put("secret", "doomed", {"k": "v"})
+tool("dump", "-o", "plan.json")
+doc = json.load(open("plan.json"))
+doc["mounts"]["secret"].pop("doomed")           # so the plan has a deletion too
+doc["mounts"]["secret"]["protected"]["data"] = {"k": "changed"}
+with open("plan.json", "w") as f:
+    json.dump(doc, f)
+POLICY5 = '''
+path "secret/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "kv2b/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+path "secret/metadata/protected" { capabilities = ["read", "list"] }
+'''
+p = bao("policy", "write", "nowrite", "-", stdin=POLICY5)
+assert p.returncode == 0, p.stderr
+p = bao("token", "create", "-policy=nowrite", "-policy=default", "-format=json")
+nowrite_token = json.loads(p.stdout)["auth"]["client_token"]
+p = tool("restore", "-i", "plan.json", "--yes",
+         env={**FULL_ENV, "BAO_TOKEN": nowrite_token})
+check("S15 restore aborts when the token cannot carry out the whole plan",
+      p.returncode != 0 and "secret/metadata/protected" in p.stdout + p.stderr,
+      p.stdout + p.stderr)
+check("S16 the deletion in that plan never ran",
+      get_data("secret", "doomed") == {"k": "v"})
+check("S17 and the write never ran either",
+      get_data("secret", "protected") == {"k": "original"})
+
+# writes must complete before any deletion starts
+p = tool("restore", "-i", "plan.json", "--yes")
+out = p.stdout
+check("S18 restore succeeds with a capable token", p.returncode == 0, p.stderr)
+check("S19 every import is printed before the first delete",
+      out.index("imported secret/protected") < out.index("deleted secret/doomed"),
+      out)
+
+# ----------------------------------------------- T. no credential in argv
+print("== T. transport ==")
+src = open("/app/baokv.py").read()
+check("T1 the tool spawns no child processes, so no credential can reach argv",
+      "subprocess" not in src and "os.system" not in src and "os.exec" not in src)
+check("T2 the session cookie is sent as a request header",
+      'add_header("Cookie"' in src)
+
+# ------------------------------- U. every failed list hides a subtree
+print("== U. list-failure handling ==")
+# 404 means "nothing here" and is a real answer; anything else leaves a subtree
+# looking empty when it is not, and a restore reads that as "delete all of it".
+# Forcing a 5xx or a dropped connection from a live server is not practical, so
+# drive walk() directly with a stubbed transport.
+sys.path.insert(0, "/app")
+import baokv
+
+real_api = baokv.api
+
+
+def stub(status, err):
+    def fake(method, path, body=None, check=True):
+        baokv.last_status, baokv.last_error = status, err
+        return None
+    return fake
+
+
+def walk_with(status, err):
+    baokv.incomplete_reasons.clear()
+    baokv.api = stub(status, err)
+    try:
+        return baokv.walk("secret"), list(baokv.incomplete_reasons)
+    finally:
+        baokv.api = real_api
+        baokv.incomplete_reasons.clear()
+
+
+leaves, reasons = walk_with(404, "HTTP 404")
+check("U1 an empty subtree (404) is a real answer, not a failure",
+      leaves == [] and reasons == [], reasons)
+leaves, reasons = walk_with(403, "permission denied")
+check("U2 a denied list marks the result incomplete",
+      len(reasons) == 1 and "MISSING" in reasons[0], reasons)
+leaves, reasons = walk_with(500, "internal server error")
+check("U3 a 5xx list marks the result incomplete (used to pass silently)",
+      len(reasons) == 1 and "MISSING" in reasons[0], reasons)
+leaves, reasons = walk_with(None, "[Errno 111] Connection refused")
+check("U4 a dropped connection mid-walk marks the result incomplete",
+      len(reasons) == 1 and "MISSING" in reasons[0], reasons)
+
+# the regression risk of the above: an ordinary empty mount must stay complete
+reset_mount("secret")
+reset_mount("kv2b")
+put("secret", "only", {"k": "v"})
+p = tool("dump", "-o", "emptymount.json")
+doc = json.load(open("emptymount.json"))
+check("U5 a mount with no secrets still dumps as complete",
+      p.returncode == 0 and doc["complete"] is True
+      and doc["mounts"]["kv2b"] == {}, doc.get("incomplete_reasons"))
+
 # -------------------------------------------------------------------- report
 print()
 failed = [n for n, ok in results if not ok]

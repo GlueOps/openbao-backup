@@ -3,7 +3,7 @@
 
 Runs INSIDE a docker image (openbao + python3) — the only local dependency
 is the docker CLI. The `bao` binary in the image makes all API calls; an
-oauth2-proxy cookie is injected on every request via `bao -header`. Mount a
+oauth2-proxy cookie is sent as a request header on every call. Mount a
 host directory at /work for dump files. See README.md for the full
 `docker run` commands.
 
@@ -18,80 +18,175 @@ Subcommands:
   restore -i secrets.json       # DESTRUCTIVE: make server match file
   restore -i secrets.json --dry-run
   restore -i secrets.json --yes
+  restore -i secrets.json --allow-incomplete --allow-mount-deletion
 """
 
 import argparse
 import datetime
 import json
 import os
-import subprocess
+import ssl
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 DUMP_FORMAT = "openbao-kvv2-dump-v1"
 
 
 def require_env(name, hint):
     value = os.environ.get(name, "").strip()
-    if not value or "REPLACE_WITH" in value:
+    if not value or value.startswith("REPLACE_WITH"):
         sys.exit(f"error: set the {name} env var ({hint}) — "
                  "pass it with docker run -e or --env-file")
     return value
 
 
-def cookie_header():
+def cookie_value():
     raw = require_env("BAO_COOKIE", "your _oauth2_proxy cookie value")
     if not raw.startswith("_oauth2_proxy="):
         raw = "_oauth2_proxy=" + raw
-    return "Cookie=" + raw
+    return raw
+
+
+# hosts where cleartext is expected: the test suites run a disposable dev
+# server over http on a private docker network
+PLAINTEXT_OK = ("localhost", "127.0.0.1", "::1", "openbao")
 
 
 def setup_env():
-    os.environ["VAULT_ADDR"] = require_env(
-        "BAO_ADDR", "server URL, e.g. https://foobar.example.com")
+    addr = require_env("BAO_ADDR", "server URL, e.g. https://foobar.example.com")
+    host = urllib.parse.urlparse(addr).hostname or ""
+    if not addr.startswith("https://") and host not in PLAINTEXT_OK:
+        print(f"# WARNING: {addr} is not https — your token, your oauth2-proxy "
+              "cookie and every secret value will cross the network in "
+              "cleartext", file=sys.stderr)
+    os.environ["VAULT_ADDR"] = addr
     os.environ["VAULT_TOKEN"] = require_env("BAO_TOKEN", "your OpenBao token")
 
 
 last_error = None
+last_status = None
+
+# Warnings that mean the RESULT IS MISSING DATA. A later restore reads absence
+# as "this secret should not exist" and deletes it, so this has to travel in
+# the dump file — a line on stderr is gone by the time a cron-produced file is
+# restored months later.
+incomplete_reasons = []
 
 
-def bao(subcommand, *rest, stdin=None, check=True):
-    """Run a bao subcommand; inject the oauth2 cookie.
+def warn_incomplete(msg):
+    incomplete_reasons.append(msg)
+    print(f"#   WARNING: {msg}", file=sys.stderr)
 
-    `subcommand` is the full space-separated command ("kv metadata delete");
-    the -header flag must come after it but before positional args.
-    """
-    global last_error
-    cmd = (["bao"] + subcommand.split()
-           + [f"-header={cookie_header()}"] + list(rest))
-    p = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
-    last_error = None if p.returncode == 0 else (p.stderr or p.stdout).strip()
-    if p.returncode != 0:
-        err = last_error
-        if "Redirecting" in err or "302" in err:
-            sys.exit("error: got an OAuth redirect — your _oauth2_proxy "
-                     "cookie has likely expired. Grab a fresh one from your "
-                     "browser and update the BAO_COOKIE env var")
-        if check:
-            sys.exit(f"error: bao {subcommand}: {err}")
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The oauth2-proxy answers an expired session with a redirect to the OAuth
+    login. Following it would fetch an HTML page and fail later with a confusing
+    JSON error, so refuse the redirect and let it surface as an HTTPError."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
-    return p.stdout
 
 
-def bao_json(*args, **kw):
-    out = bao(*args, **kw)
-    return json.loads(out) if out else None
+_opener = None
+
+
+def opener():
+    global _opener
+    if _opener is None:
+        ctx = ssl.create_default_context(
+            cafile=os.environ.get("BAO_CACERT") or None)
+        _opener = urllib.request.build_opener(
+            NoRedirect, urllib.request.HTTPSHandler(context=ctx))
+    return _opener
+
+
+def enc(path):
+    """Percent-encode a KV path for a URL. `/` stays a separator; everything
+    else is escaped, including a literal `%` (so a secret actually named
+    `%2F` survives as `%252F` rather than decoding back into a separator)."""
+    return urllib.parse.quote(path, safe="/")
+
+
+def expired_cookie():
+    sys.exit("error: got an OAuth redirect — your _oauth2_proxy cookie has "
+             "likely expired. Grab a fresh one from your browser and update "
+             "the BAO_COOKIE env var")
+
+
+def api(method, path, body=None, check=True):
+    """One OpenBao HTTP call. `path` is everything after /v1/, already
+    percent-encoded. Returns the decoded JSON body, or None on a handled
+    failure when check is False.
+
+    The token and the session cookie travel as request headers. They used to
+    be `bao -header=Cookie=...` on the command line, where anything sharing
+    the container's PID namespace could read them out of /proc.
+    """
+    global last_error, last_status
+    url = f"{os.environ['VAULT_ADDR'].rstrip('/')}/v1/{path}"
+    req = urllib.request.Request(
+        url, method=method,
+        data=json.dumps(body).encode() if body is not None else None)
+    req.add_header("X-Vault-Token", os.environ["VAULT_TOKEN"])
+    req.add_header("Cookie", cookie_value())
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+
+    try:
+        with opener().open(req) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        last_status = e.code
+        if e.code in (301, 302, 303, 307, 308):
+            expired_cookie()
+        raw = e.read()
+        try:
+            doc = json.loads(raw) if raw else None
+        except ValueError:
+            doc = None
+        # kv-v2 answers 404 for a soft-deleted or destroyed current version,
+        # but with the real envelope attached (data.data is null). That is not
+        # a failure — the caller needs to see it to tell the two apart.
+        if e.code == 404 and isinstance(doc, dict) and doc.get("data") is not None:
+            last_error = None
+            return doc
+        errors = (doc or {}).get("errors") or []
+        last_error = "; ".join(errors) or f"HTTP {e.code}"
+        if check:
+            sys.exit(f"error: {method} {path}: {last_error}")
+        return None
+    except urllib.error.URLError as e:
+        last_status = None                # never reached the server
+        last_error = str(getattr(e, "reason", e))
+        if check:
+            sys.exit(f"error: {method} {path}: cannot reach "
+                     f"{os.environ['VAULT_ADDR']}: {last_error}")
+        return None
+
+    last_error, last_status = None, 200
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        # a proxy that serves its login page with a 200 rather than a redirect
+        expired_cookie()
 
 
 def preflight():
-    info = bao_json("token lookup", "-format=json")
-    d = info["data"]
+    d = (api("GET", "auth/token/lookup-self") or {}).get("data") or {}
+    if not d:
+        sys.exit("error: token lookup returned no data — is BAO_TOKEN a valid "
+                 "token for this server?")
     expires = (d.get("expire_time") or "never")[:10]
     print(f"# auth ok: {d.get('display_name')} policies={d.get('policies')} "
           f"token expires {expires}", file=sys.stderr)
 
 
 def kvv2_mounts():
-    out = bao_json("read", "-format=json", "sys/internal/ui/mounts")
+    out = api("GET", "sys/internal/ui/mounts")
     mounts = []
     for path, info in sorted(out["data"]["secret"].items()):
         if info.get("type") == "kv" and (info.get("options") or {}).get("version") == "2":
@@ -104,14 +199,17 @@ def walk(mount):
     leaves, stack = [], [""]
     while stack:
         prefix = stack.pop()
-        out = bao_json("kv list", "-format=json", f"{mount}/{prefix}", check=False)
-        if out is None and last_error and "permission denied" in last_error:
-            # a silently-missing subtree would be DELETED by a later restore
-            print(f"#   WARNING: cannot list {mount}/{prefix} (permission "
-                  "denied) — this whole subtree is MISSING from the result; "
-                  "do not restore from a dump made with this token",
-                  file=sys.stderr)
-        for entry in (out or []):
+        out = api("GET", f"{enc(mount)}/metadata/{enc(prefix)}?list=true",
+                  check=False)
+        # 404 is how kv-v2 says "nothing here", which is a real answer. Every
+        # other failure — denied, a 5xx, a connection reset mid-walk — leaves a
+        # subtree looking empty when it is not, and a later restore reads that
+        # as "delete all of it". Only 404 may pass without a warning.
+        if out is None and last_status != 404:
+            warn_incomplete(f"cannot list {mount}/{prefix} ({last_error}) — "
+                            "this whole subtree is MISSING from the result and "
+                            "a restore from this dump would DELETE it")
+        for entry in ((out or {}).get("data") or {}).get("keys") or []:
             if entry.endswith("/"):
                 stack.append(prefix + entry)
             else:
@@ -119,12 +217,19 @@ def walk(mount):
     return sorted(leaves)
 
 
+# A secret whose current version is soft-deleted or destroyed is an ordinary,
+# documented state, not a gap in what we were allowed to see. Marking those
+# dumps incomplete would make --allow-incomplete a permanent habit, and a flag
+# everyone always passes stops protecting anything.
+SOFT_DELETED = "soft-deleted"
+
+
 def read_secret(mount, path):
-    out = bao_json("kv get", "-format=json", f"{mount}/{path}", check=False)
-    if out is None or out["data"]["data"] is None:
-        # unreadable, or current version soft-deleted/destroyed (the API
-        # then returns success with data: null)
-        return None
+    out = api("GET", f"{enc(mount)}/data/{enc(path)}", check=False)
+    if out is None or out.get("data") is None:
+        return None                       # unreadable: denied, or an error
+    if out["data"]["data"] is None:
+        return SOFT_DELETED               # success, but data: null
     meta = out["data"]["metadata"]
     return {
         "data": out["data"]["data"],
@@ -135,9 +240,10 @@ def read_secret(mount, path):
 
 
 def has_unsafe_number(v):
-    """True if any number in v needs more precision than float64 offers —
-    the bao CLI decodes JSON numbers as float64, so such values may already
-    have been rounded and cannot be trusted bit-for-bit."""
+    """True if any number in v needs more precision than float64 offers.
+    OpenBao itself decodes JSON numbers into float64, so such values have
+    already been rounded server-side and cannot be recovered — reading them
+    over the raw HTTP API does not help (test Q measures exactly this)."""
     if isinstance(v, bool):
         return False
     if isinstance(v, (int, float)):
@@ -149,33 +255,37 @@ def has_unsafe_number(v):
     return False
 
 
-def collect(include_values):
+def collect():
+    """Read every secret in every visible kv-v2 mount. `list` needs the values
+    too — it prints key names, not values — so there is no cheaper mode."""
     result = {}
     for mount in kvv2_mounts():
         print(f"# walking {mount}/ ...", file=sys.stderr)
         secrets = {}
         for path in walk(mount):
-            if include_values:
-                s = read_secret(mount, path)
-                if s is None:
-                    print(f"#   WARNING: skipping {mount}/{path} "
-                          "(current version deleted or unreadable)", file=sys.stderr)
-                    continue
-                if has_unsafe_number(s["data"]):
-                    print(f"#   WARNING: {mount}/{path} contains a number at "
-                          "or above 2^53 — the bao CLI rounds such values to "
-                          "float64, so it may not round-trip exactly; store "
-                          "huge numbers as strings", file=sys.stderr)
-                secrets[path] = s
-            else:
-                secrets[path] = None
+            s = read_secret(mount, path)
+            if s is SOFT_DELETED:
+                print(f"#   WARNING: skipping {mount}/{path} (current version "
+                      "soft-deleted or destroyed) — a restore from this dump "
+                      "will remove it", file=sys.stderr)
+                continue
+            if s is None:
+                warn_incomplete(f"cannot read {mount}/{path} — it is MISSING "
+                                "from the result and a restore would DELETE it")
+                continue
+            if has_unsafe_number(s["data"]):
+                print(f"#   WARNING: {mount}/{path} contains a number at or "
+                      "above 2^53 — OpenBao stores such values as float64, so "
+                      "the exact value is already gone; store huge numbers as "
+                      "strings", file=sys.stderr)
+            secrets[path] = s
         result[mount] = secrets
     return result
 
 
 def cmd_list(_args):
     preflight()
-    data = collect(include_values=True)
+    data = collect()
     total = 0
     for mount, secrets in data.items():
         print(f"{mount}/  ({len(secrets)} secrets)")
@@ -189,19 +299,77 @@ def cmd_list(_args):
 
 def cmd_dump(args):
     preflight()
-    data = collect(include_values=True)
+    data = collect()
     doc = {
         "format": DUMP_FORMAT,
         "address": os.environ["VAULT_ADDR"],
         "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "complete": not incomplete_reasons,
         "mounts": data,
     }
-    fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if incomplete_reasons:
+        doc["incomplete_count"] = len(incomplete_reasons)
+        doc["incomplete_reasons"] = incomplete_reasons[:20]
+    warn_if_in_git_worktree(args.output)
+    # O_EXCL: never write secrets into a path someone else pre-created (a
+    # symlink, a hard link, or a file they still hold an open fd on).
+    # O_NOFOLLOW: belt and braces, since O_EXCL already refuses symlinks.
+    try:
+        fd = os.open(args.output,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        sys.exit(f"error: {args.output} already exists — refusing to write "
+                 "secrets onto an existing path. Pick a new filename (the "
+                 "README's examples timestamp it) or remove the old file.")
+    os.fchmod(fd, 0o600)  # the mode above applies only on create
     with os.fdopen(fd, "w") as f:
         json.dump(doc, f, indent=2, sort_keys=True)
         f.write("\n")
     n = sum(len(s) for s in data.values())
     print(f"# wrote {n} secrets from {len(data)} mount(s) to {args.output}")
+    if incomplete_reasons:
+        print(f"# INCOMPLETE: {len(incomplete_reasons)} secret(s) or subtree(s) "
+              "could not be read. This dump is marked incomplete and restore "
+              "will refuse it — everything missing here would be DELETED by a "
+              "restore. Re-dump with a token that can read and list "
+              "everything.", file=sys.stderr)
+
+
+def check_capabilities(to_write, to_delete):
+    """Confirm the token may perform every operation in the plan before any of
+    it runs. sys/capabilities-self is a pure read — no canary is written into
+    the target mounts."""
+    need = {}
+    for mount, path, _ in to_write:
+        need[f"{mount}/data/{path}"] = {"create", "update"}   # either suffices
+        need[f"{mount}/metadata/{path}"] = {"delete"}         # wipes history
+    for mount, path in to_delete:
+        need[f"{mount}/metadata/{path}"] = {"delete"}
+    if not need:
+        return
+    paths, denied = sorted(need), []
+    for i in range(0, len(paths), 100):
+        chunk = paths[i:i + 100]
+        out = api("POST", "sys/capabilities-self", {"paths": chunk},
+                  check=False)
+        if out is None:
+            # advisory only: the reordering below is what prevents data loss
+            print("# WARNING: could not check token capabilities "
+                  f"({last_error}) — proceeding without the pre-check",
+                  file=sys.stderr)
+            return
+        for p in chunk:
+            got = set(out["data"].get(p) or [])
+            if not ({"root", "sudo"} & got) and not (need[p] & got):
+                denied.append(f"{p} (need one of {sorted(need[p])}, have "
+                              f"{sorted(got) or ['nothing']})")
+    if denied:
+        shown = "\n  ".join(denied[:10])
+        more = f"\n  ... and {len(denied) - 10} more" if len(denied) > 10 else ""
+        sys.exit(f"error: this token cannot carry out the whole plan, so the "
+                 f"restore would stop part-way through:\n  {shown}{more}\n"
+                 "Nothing has been changed. Re-run with a token that covers "
+                 "every path above.")
 
 
 def cmd_restore(args):
@@ -210,6 +378,22 @@ def cmd_restore(args):
         doc = json.load(f)
     if doc.get("format") != DUMP_FORMAT:
         sys.exit(f"error: {args.input} is not a {DUMP_FORMAT} file")
+    # A missing "complete" key means a dump written before this field existed;
+    # those cannot be judged, so they are allowed through.
+    if doc.get("complete") is False and not args.allow_incomplete:
+        reasons = "\n  ".join(doc.get("incomplete_reasons") or ["(not recorded)"])
+        sys.exit(f"error: {args.input} is marked INCOMPLETE — "
+                 f"{doc.get('incomplete_count', '?')} secret(s) or subtree(s) "
+                 "could not be read when it was made:\n  "
+                 f"{reasons}\nRestoring it would DELETE every one of them "
+                 "from the server. Re-dump with a token that can read and list "
+                 "everything, or pass --allow-incomplete.")
+    source = doc.get("address")
+    if source and source != os.environ["VAULT_ADDR"] and not args.allow_address_mismatch:
+        sys.exit(f"error: {args.input} was dumped from {source} but BAO_ADDR "
+                 f"is {os.environ['VAULT_ADDR']}. Restoring it here would make "
+                 "this server match a different server's contents. Pass "
+                 "--allow-address-mismatch if that is what you intend.")
 
     preflight()
     file_mounts = doc["mounts"]
@@ -222,7 +406,28 @@ def cmd_restore(args):
 
     # Audit current server state before touching anything.
     print("# auditing current server state ...", file=sys.stderr)
+    audit_start = len(incomplete_reasons)
     server_state = {m: walk(m) for m in server_mounts}
+    if len(incomplete_reasons) > audit_start:
+        print("# WARNING: parts of the server could not be listed during the "
+              "audit, so the plan below may be missing entries", file=sys.stderr)
+
+    # A mount the FILE has no entry for is not a mount the file says is empty.
+    # `sys/internal/ui/mounts` is filtered by the dumping token's policy, so a
+    # mount that token could not see is simply absent — and treating absent as
+    # empty deletes every secret in it, permanently, with no warning.
+    absent = [m for m in server_mounts if m not in doc["mounts"]]
+    if absent and not args.allow_mount_deletion:
+        detail = "\n  ".join(
+            f"{m}/ ({len(server_state[m])} secret"
+            f"{'' if len(server_state[m]) == 1 else 's'})" for m in absent)
+        sys.exit(f"error: these kv-v2 mounts exist on the server but are "
+                 f"absent from {args.input}:\n  {detail}\n"
+                 "The file has no opinion about them, which is not the same as "
+                 "saying they should be empty — the dump may have been made "
+                 "with a token that could not see them. Every secret in them "
+                 "would be permanently deleted. Re-dump with a token that "
+                 "covers every mount, or pass --allow-mount-deletion.")
 
     to_delete, to_write = [], []
     for mount, paths in server_state.items():
@@ -240,6 +445,8 @@ def cmd_restore(args):
     for m, p in to_delete:
         print(f"    - {m}/{p}")
 
+    check_capabilities(to_write, to_delete)
+
     if args.dry_run:
         print("\n# dry run: no changes made")
         return
@@ -248,30 +455,69 @@ def cmd_restore(args):
         if reply.strip() != "yes":
             sys.exit("aborted, no changes made")
 
-    for mount, path in to_delete:
-        bao("kv metadata delete", f"{mount}/{path}")
-        print(f"deleted {mount}/{path}")
-    for mount, path, s in to_write:
-        # metadata delete wipes old versions so the imported state is clean;
-        # -cas=0 is then always valid and keeps restore working on mounts
-        # with cas_required=true
-        bao("kv metadata delete", f"{mount}/{path}", check=False)
-        bao("kv put", "-cas=0", f"{mount}/{path}", "-",
-            stdin=json.dumps(s["data"]))
-        if s.get("custom_metadata"):
-            bao("write", f"{mount}/metadata/{path}", "-",
-                stdin=json.dumps({"custom_metadata": s["custom_metadata"]}))
-        print(f"imported {mount}/{path}")
-    print(f"\n# done: {len(to_write)} imported, {len(to_delete)} deleted")
+    # Writes first, deletions last. Everything the write phase touches is
+    # present in the file, so an abort there is recoverable by re-running.
+    # Deletions remove data that is NOT in the file and nothing can bring it
+    # back, so they must not run until every write has succeeded.
+    written = deleted = 0
+    phase = "write"
+    try:
+        for mount, path, s in to_write:
+            # metadata delete wipes old versions so the imported state is
+            # clean; -cas=0 is then always valid and keeps restore working on
+            # mounts with cas_required=true
+            api("DELETE", f"{enc(mount)}/metadata/{enc(path)}", check=False)
+            api("POST", f"{enc(mount)}/data/{enc(path)}",
+                {"data": s["data"], "options": {"cas": 0}})
+            if s.get("custom_metadata"):
+                api("POST", f"{enc(mount)}/metadata/{enc(path)}",
+                    {"custom_metadata": s["custom_metadata"]})
+            written += 1
+            print(f"imported {mount}/{path}")
+        phase = "delete"
+        for mount, path in to_delete:
+            api("DELETE", f"{enc(mount)}/metadata/{enc(path)}")
+            deleted += 1
+            print(f"deleted {mount}/{path}")
+    except SystemExit:
+        if phase == "write":
+            print(f"\n# ABORTED during the write phase: {written}/{len(to_write)} "
+                  f"imported, none of the {len(to_delete)} deletions attempted. "
+                  "Nothing outside the file was touched — every secret affected "
+                  f"so far is present in {args.input}, so re-running the same "
+                  "restore recovers it.", file=sys.stderr)
+        else:
+            print(f"\n# ABORTED during the delete phase: all {written} writes "
+                  f"succeeded, {deleted}/{len(to_delete)} deletions done. The "
+                  "remaining deletions did not run; re-run the same restore to "
+                  "finish.", file=sys.stderr)
+        raise
+    print(f"\n# done: {written} imported, {deleted} deleted")
 
 
 def json_path(value):
-    # dump files hold plaintext secrets; forcing a .json suffix keeps them
-    # covered by the repo's *.json gitignore rule
     if not value.endswith(".json"):
-        raise argparse.ArgumentTypeError(
-            f"'{value}' must end in .json so dump files stay git-ignored")
+        raise argparse.ArgumentTypeError(f"'{value}' must end in .json")
     return value
+
+
+def warn_if_in_git_worktree(path):
+    """A dump holds every secret in plaintext. The .json suffix matches this
+    repo's `*.json` ignore rule, but a suffix cannot prove a path is ignored —
+    negation rules exist, and other repos have other rules. Say so out loud
+    rather than implying a guarantee (git is not in the image, so the ignore
+    rules cannot be evaluated here)."""
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            print(f"# WARNING: {path} is inside a git working tree ({d}). It "
+                  "will hold every secret in plaintext — confirm the path is "
+                  "git-ignored before committing anything.", file=sys.stderr)
+            return
+        parent = os.path.dirname(d)
+        if parent == d:
+            return
+        d = parent
 
 
 def main():
@@ -283,6 +529,13 @@ def main():
     p = sub.add_parser("restore", help="DESTRUCTIVE: make server match a dump file")
     p.add_argument("-i", "--input", required=True, type=json_path)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--allow-address-mismatch", action="store_true",
+                   help="restore a dump taken from a different BAO_ADDR")
+    p.add_argument("--allow-incomplete", action="store_true",
+                   help="restore a dump marked incomplete (DELETES everything "
+                        "the dump could not read)")
+    p.add_argument("--allow-mount-deletion", action="store_true",
+                   help="empty kv-v2 mounts the dump file does not mention")
     p.add_argument("--yes", action="store_true", help="skip confirmation prompt")
     args = ap.parse_args()
 
