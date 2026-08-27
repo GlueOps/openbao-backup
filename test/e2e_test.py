@@ -818,6 +818,58 @@ check("T1 the tool spawns no child processes, so no credential can reach argv",
 check("T2 the session cookie is sent as a request header",
       'add_header("Cookie"' in src)
 
+# ------------------------------- U. every failed list hides a subtree
+print("== U. list-failure handling ==")
+# 404 means "nothing here" and is a real answer; anything else leaves a subtree
+# looking empty when it is not, and a restore reads that as "delete all of it".
+# Forcing a 5xx or a dropped connection from a live server is not practical, so
+# drive walk() directly with a stubbed transport.
+sys.path.insert(0, "/app")
+import baokv
+
+real_api = baokv.api
+
+
+def stub(status, err):
+    def fake(method, path, body=None, check=True):
+        baokv.last_status, baokv.last_error = status, err
+        return None
+    return fake
+
+
+def walk_with(status, err):
+    baokv.incomplete_reasons.clear()
+    baokv.api = stub(status, err)
+    try:
+        return baokv.walk("secret"), list(baokv.incomplete_reasons)
+    finally:
+        baokv.api = real_api
+        baokv.incomplete_reasons.clear()
+
+
+leaves, reasons = walk_with(404, "HTTP 404")
+check("U1 an empty subtree (404) is a real answer, not a failure",
+      leaves == [] and reasons == [], reasons)
+leaves, reasons = walk_with(403, "permission denied")
+check("U2 a denied list marks the result incomplete",
+      len(reasons) == 1 and "MISSING" in reasons[0], reasons)
+leaves, reasons = walk_with(500, "internal server error")
+check("U3 a 5xx list marks the result incomplete (used to pass silently)",
+      len(reasons) == 1 and "MISSING" in reasons[0], reasons)
+leaves, reasons = walk_with(None, "[Errno 111] Connection refused")
+check("U4 a dropped connection mid-walk marks the result incomplete",
+      len(reasons) == 1 and "MISSING" in reasons[0], reasons)
+
+# the regression risk of the above: an ordinary empty mount must stay complete
+reset_mount("secret")
+reset_mount("kv2b")
+put("secret", "only", {"k": "v"})
+p = tool("dump", "-o", "emptymount.json")
+doc = json.load(open("emptymount.json"))
+check("U5 a mount with no secrets still dumps as complete",
+      p.returncode == 0 and doc["complete"] is True
+      and doc["mounts"]["kv2b"] == {}, doc.get("incomplete_reasons"))
+
 # -------------------------------------------------------------------- report
 print()
 failed = [n for n, ok in results if not ok]

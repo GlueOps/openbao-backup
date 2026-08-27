@@ -36,7 +36,7 @@ DUMP_FORMAT = "openbao-kvv2-dump-v1"
 
 def require_env(name, hint):
     value = os.environ.get(name, "").strip()
-    if not value or "REPLACE_WITH" in value:
+    if not value or value.startswith("REPLACE_WITH"):
         sys.exit(f"error: set the {name} env var ({hint}) — "
                  "pass it with docker run -e or --env-file")
     return value
@@ -66,6 +66,7 @@ def setup_env():
 
 
 last_error = None
+last_status = None
 
 # Warnings that mean the RESULT IS MISSING DATA. A later restore reads absence
 # as "this secret should not exist" and deletes it, so this has to travel in
@@ -123,7 +124,7 @@ def api(method, path, body=None, check=True):
     be `bao -header=Cookie=...` on the command line, where anything sharing
     the container's PID namespace could read them out of /proc.
     """
-    global last_error
+    global last_error, last_status
     url = f"{os.environ['VAULT_ADDR'].rstrip('/')}/v1/{path}"
     req = urllib.request.Request(
         url, method=method,
@@ -137,6 +138,7 @@ def api(method, path, body=None, check=True):
         with opener().open(req) as r:
             raw = r.read()
     except urllib.error.HTTPError as e:
+        last_status = e.code
         if e.code in (301, 302, 303, 307, 308):
             expired_cookie()
         raw = e.read()
@@ -156,13 +158,14 @@ def api(method, path, body=None, check=True):
             sys.exit(f"error: {method} {path}: {last_error}")
         return None
     except urllib.error.URLError as e:
+        last_status = None                # never reached the server
         last_error = str(getattr(e, "reason", e))
         if check:
             sys.exit(f"error: {method} {path}: cannot reach "
                      f"{os.environ['VAULT_ADDR']}: {last_error}")
         return None
 
-    last_error = None
+    last_error, last_status = None, 200
     if not raw:
         return None
     try:
@@ -173,7 +176,10 @@ def api(method, path, body=None, check=True):
 
 
 def preflight():
-    d = api("GET", "auth/token/lookup-self")["data"]
+    d = (api("GET", "auth/token/lookup-self") or {}).get("data") or {}
+    if not d:
+        sys.exit("error: token lookup returned no data — is BAO_TOKEN a valid "
+                 "token for this server?")
     expires = (d.get("expire_time") or "never")[:10]
     print(f"# auth ok: {d.get('display_name')} policies={d.get('policies')} "
           f"token expires {expires}", file=sys.stderr)
@@ -195,11 +201,14 @@ def walk(mount):
         prefix = stack.pop()
         out = api("GET", f"{enc(mount)}/metadata/{enc(prefix)}?list=true",
                   check=False)
-        if out is None and last_error and "permission denied" in last_error:
-            # a silently-missing subtree would be DELETED by a later restore
-            warn_incomplete(f"cannot list {mount}/{prefix} (permission denied) "
-                            "— this whole subtree is MISSING from the result; "
-                            "do not restore from a dump made with this token")
+        # 404 is how kv-v2 says "nothing here", which is a real answer. Every
+        # other failure — denied, a 5xx, a connection reset mid-walk — leaves a
+        # subtree looking empty when it is not, and a later restore reads that
+        # as "delete all of it". Only 404 may pass without a warning.
+        if out is None and last_status != 404:
+            warn_incomplete(f"cannot list {mount}/{prefix} ({last_error}) — "
+                            "this whole subtree is MISSING from the result and "
+                            "a restore from this dump would DELETE it")
         for entry in ((out or {}).get("data") or {}).get("keys") or []:
             if entry.endswith("/"):
                 stack.append(prefix + entry)
@@ -246,39 +255,37 @@ def has_unsafe_number(v):
     return False
 
 
-def collect(include_values):
+def collect():
+    """Read every secret in every visible kv-v2 mount. `list` needs the values
+    too — it prints key names, not values — so there is no cheaper mode."""
     result = {}
     for mount in kvv2_mounts():
         print(f"# walking {mount}/ ...", file=sys.stderr)
         secrets = {}
         for path in walk(mount):
-            if include_values:
-                s = read_secret(mount, path)
-                if s is SOFT_DELETED:
-                    print(f"#   WARNING: skipping {mount}/{path} (current "
-                          "version soft-deleted or destroyed) — a restore from "
-                          "this dump will remove it", file=sys.stderr)
-                    continue
-                if s is None:
-                    warn_incomplete(f"cannot read {mount}/{path} — it is "
-                                    "MISSING from the result and a restore "
-                                    "would DELETE it")
-                    continue
-                if has_unsafe_number(s["data"]):
-                    print(f"#   WARNING: {mount}/{path} contains a number at "
-                          "or above 2^53 — OpenBao stores such values as "
-                          "float64, so the exact value is already gone; store "
-                          "huge numbers as strings", file=sys.stderr)
-                secrets[path] = s
-            else:
-                secrets[path] = None
+            s = read_secret(mount, path)
+            if s is SOFT_DELETED:
+                print(f"#   WARNING: skipping {mount}/{path} (current version "
+                      "soft-deleted or destroyed) — a restore from this dump "
+                      "will remove it", file=sys.stderr)
+                continue
+            if s is None:
+                warn_incomplete(f"cannot read {mount}/{path} — it is MISSING "
+                                "from the result and a restore would DELETE it")
+                continue
+            if has_unsafe_number(s["data"]):
+                print(f"#   WARNING: {mount}/{path} contains a number at or "
+                      "above 2^53 — OpenBao stores such values as float64, so "
+                      "the exact value is already gone; store huge numbers as "
+                      "strings", file=sys.stderr)
+            secrets[path] = s
         result[mount] = secrets
     return result
 
 
 def cmd_list(_args):
     preflight()
-    data = collect(include_values=True)
+    data = collect()
     total = 0
     for mount, secrets in data.items():
         print(f"{mount}/  ({len(secrets)} secrets)")
@@ -292,7 +299,7 @@ def cmd_list(_args):
 
 def cmd_dump(args):
     preflight()
-    data = collect(include_values=True)
+    data = collect()
     doc = {
         "format": DUMP_FORMAT,
         "address": os.environ["VAULT_ADDR"],

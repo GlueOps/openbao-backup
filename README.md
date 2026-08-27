@@ -143,6 +143,10 @@ server upgrade. Run this before bumping the pinned OpenBao version.
 
 ## Notes / limitations
 
+- `list` prints no values, but it still reads every secret to get the key
+  names — so it produces exactly the same per-secret read audit-log entries as
+  `dump`, and pulls the same plaintext over the wire. It is an audit of what
+  exists, not a cheaper or quieter call.
 - Only KV v2 mounts are handled (all of them are auto-discovered via
   `sys/internal/ui/mounts`; the oauth proxy blocks `/v1/sys/mounts`).
 - The dump stores the **current version** of each secret plus its
