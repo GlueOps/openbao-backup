@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/GlueOps/openbao-backup/compare/v0.2.1...v0.3.0) (2026-10-27)
+
+
+### Features
+
+* update docker/build-push-action to v7.4.0 #minor ([#29](https://github.com/GlueOps/openbao-backup/issues/29)) ([3dda4be](https://github.com/GlueOps/openbao-backup/commit/3dda4beb7dc3d6fd40cf960fa613095d53a414f0))
+* update docker/login-action to v4.6.0 #minor ([#26](https://github.com/GlueOps/openbao-backup/issues/26)) ([13ebcac](https://github.com/GlueOps/openbao-backup/commit/13ebcacced5331423cf7fa12de3f9b785e828eee))
+* update docker/setup-buildx-action to v4.4.1 #minor ([#30](https://github.com/GlueOps/openbao-backup/issues/30)) ([e7a231a](https://github.com/GlueOps/openbao-backup/commit/e7a231a40dd0dfdc9daa00949f61795dd1976ea8))
+
 ## [0.2.1](https://github.com/GlueOps/openbao-backup/compare/v0.2.0...v0.2.1) (2026-08-27)
 
 
