@@ -1,4 +1,4 @@
-FROM openbao/openbao:2.6.1@sha256:5b2486ab0fb90bbc788cc345b0a08616dfb375873ee8be5df3a2fd4d378a67e0
+FROM openbao/openbao:2.6.5@sha256:09f1eaaee351c329d75a5a89654d6e1ad4792998650c3cbf0c3513a76d9d9b6e
 USER root
 RUN apk add --no-cache python3
 COPY baokv.py /app/baokv.py
